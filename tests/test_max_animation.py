@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import struct
 import sys
 import unittest
@@ -20,17 +21,27 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from source import import_max  # noqa: E402
 from source.import_max import (  # noqa: E402
+    Mesh3d,
+    apply_smoothing_groups,
+    calc_point_3d,
+    draw_shape,
     get_multi_material_ids,
+    get_mesh_polys,
     remap_material_indices,
 )
 from source.max_animation import (  # noqa: E402
     ActionBuilder,
+    TICKS_PER_SECOND,
     extract_transform_tracks,
     max_quaternion,
     max_scale_matrix,
     sample_transform,
 )
 from tools.blender_import import validate_scene_stats  # noqa: E402
+from tools.inspect_max import (  # noqa: E402
+    data_summary,
+    derived_stack_summaries,
+)
 
 
 class Chunk:
@@ -46,12 +57,26 @@ class Chunk:
         return self.chunks.get(chunk_type)
 
 
-def key_data(record_size: int, values: list[tuple[int, tuple[float, ...]]]) -> bytes:
+def key_data(
+    record_size: int,
+    values: list[tuple[int, tuple[float, ...]]],
+    *,
+    flags: list[int] | None = None,
+    fields: list[dict[int, tuple[float, ...]]] | None = None,
+) -> bytes:
     data = bytearray(record_size * len(values))
     for index, (time, value) in enumerate(values):
         offset = index * record_size
-        struct.pack_into("<iI", data, offset, time, 0)
+        struct.pack_into("<iI", data, offset, time, flags[index] if flags else 0)
         struct.pack_into("<%df" % len(value), data, offset + 8, *value)
+        if fields:
+            for field_offset, field_value in fields[index].items():
+                struct.pack_into(
+                    "<%df" % len(field_value),
+                    data,
+                    offset + field_offset,
+                    *field_value,
+                )
     return bytes(data)
 
 
@@ -183,6 +208,181 @@ class AnimationTests(unittest.TestCase):
                 expected = (1.0, 0.0, 0.0, 0.0) if track_name == "rotation" else value
                 np.testing.assert_allclose(track.values[0, :len(expected)], expected)
 
+    def test_evaluates_legacy_and_modern_bezier_tangents(self):
+        cases = (
+            ("position", 0x2008, 0x2524, 56, 20, 32, 3),
+            ("position", 0x2008, 0x2526, 80, 20, 32, 3),
+            ("scale", 0x2010, 0x2519, 92, 36, 64, 7),
+            ("scale", 0x2010, 0x2528, 148, 36, 64, 7),
+        )
+        for track_name, controller_guid, chunk_type, record_size, in_offset, out_offset, components in cases:
+            with self.subTest(track=track_name, chunk=hex(chunk_type)):
+                start = (0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0)[:components]
+                end = (1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0)[:components]
+                tangent = 0.03 if track_name == "position" else 0.03 * TICKS_PER_SECOND
+                data = key_data(
+                    record_size,
+                    [(0, start), (100, end)],
+                    fields=[
+                        {out_offset: (tangent, 0.0, 0.0)},
+                        {in_offset: (-tangent, 0.0, 0.0)},
+                    ],
+                )
+                controller = Chunk(
+                    controller_guid,
+                    chunks={chunk_type: Chunk(chunk_type, data=data)},
+                )
+                references = [None, None, None]
+                references[0 if track_name == "position" else 2] = controller
+                track = getattr(
+                    extract_transform_tracks(
+                        Chunk(0x2005, references=references),
+                        lambda chunk: chunk.guid,
+                        lambda chunk: chunk.references,
+                    ),
+                    track_name,
+                )
+
+                self.assertEqual(track.interpolation, "BEZIER")
+                np.testing.assert_allclose(
+                    track.evaluate_vectors(np.asarray((25.0,)))[:, 0],
+                    (0.4375,),
+                )
+
+    def test_evaluates_bezier_step_tangent(self):
+        position = Chunk(
+            0x2008,
+            chunks={
+                0x2526: Chunk(
+                    0x2526,
+                    data=key_data(
+                        80,
+                        [(0, (0.0, 0.0, 0.0)), (100, (1.0, 0.0, 0.0))],
+                        flags=[2 << 10, 0],
+                    ),
+                )
+            },
+        )
+        track = extract_transform_tracks(
+            Chunk(0x2005, references=[position, None, None]),
+            lambda chunk: chunk.guid,
+            lambda chunk: chunk.references,
+        ).position
+
+        np.testing.assert_allclose(
+            track.evaluate_vectors(np.asarray((25.0, 99.0, 100.0)))[:, 0],
+            (0.0, 0.0, 1.0),
+        )
+
+    def test_evaluates_tcb_tension_continuity_bias_and_ease(self):
+        def position_track(
+            values: list[tuple[int, tuple[float, ...]]],
+            parameters: list[tuple[float, ...]],
+        ):
+            position = Chunk(
+                0x442312,
+                chunks={
+                    0x2521: Chunk(
+                        0x2521,
+                        data=key_data(
+                            64,
+                            values,
+                            fields=[{20: value} for value in parameters],
+                        ),
+                    )
+                },
+            )
+            return extract_transform_tracks(
+                Chunk(0x2005, references=[position, None, None]),
+                lambda chunk: chunk.guid,
+                lambda chunk: chunk.references,
+            ).position
+
+        tension = position_track(
+            [(0, (0.0, 0.0, 0.0)), (100, (1.0, 0.0, 0.0))],
+            [(1.0, 0.0, 0.0, 0.0, 0.0)] * 2,
+        )
+        continuity = position_track(
+            [
+                (0, (0.0, 0.0, 0.0)),
+                (100, (1.0, 0.0, 0.0)),
+                (200, (3.0, 0.0, 0.0)),
+            ],
+            [
+                (0.0, 0.0, 0.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 0.0, 0.0),
+            ],
+        )
+        bias = position_track(
+            [
+                (0, (0.0, 0.0, 0.0)),
+                (100, (1.0, 0.0, 0.0)),
+                (200, (3.0, 0.0, 0.0)),
+            ],
+            [
+                (0.0, 0.0, 0.0, 0.0, 0.0),
+                (0.0, 0.0, 1.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 0.0, 0.0),
+            ],
+        )
+        ease = position_track(
+            [(0, (0.0, 0.0, 0.0)), (100, (1.0, 0.0, 0.0))],
+            [
+                (0.0, 0.0, 0.0, 0.0, 0.5),
+                (0.0, 0.0, 0.0, 0.0, 0.0),
+            ],
+        )
+
+        self.assertEqual(tension.interpolation, "TCB")
+        np.testing.assert_allclose(
+            tension.evaluate_vectors(np.asarray((25.0,)))[:, 0],
+            (0.15625,),
+        )
+        np.testing.assert_allclose(
+            continuity.evaluate_vectors(np.asarray((50.0,)))[:, 0],
+            (0.3125,),
+        )
+        np.testing.assert_allclose(
+            bias.evaluate_vectors(np.asarray((50.0,)))[:, 0],
+            (0.5,),
+        )
+        np.testing.assert_allclose(
+            ease.evaluate_vectors(np.asarray((25.0,)))[:, 0],
+            (1.0 / 12.0,),
+        )
+
+    def test_evaluates_tcb_quaternion_ease_with_squad(self):
+        half_angle = np.sqrt(0.5)
+        rotation = Chunk(
+            0x442313,
+            chunks={
+                0x2522: Chunk(
+                    0x2522,
+                    data=key_data(
+                        92,
+                        [
+                            (0, (0.0, 0.0, 0.0, 1.0)),
+                            (100, (0.0, 0.0, half_angle, half_angle)),
+                        ],
+                        fields=[
+                            {24: (0.0, 0.0, 0.0, 0.0, 0.5)},
+                            {24: (0.0, 0.0, 0.0, 0.0, 0.0)},
+                        ],
+                    ),
+                )
+            },
+        )
+        track = extract_transform_tracks(
+            Chunk(0x2005, references=[None, rotation, None]),
+            lambda chunk: chunk.guid,
+            lambda chunk: chunk.references,
+        ).rotation
+
+        quaternion = track.evaluate_quaternions(np.asarray((25.0,)))[0]
+        self.assertAlmostEqual(quaternion.angle, np.deg2rad(7.5), places=5)
+        self.assertAlmostEqual(quaternion.magnitude, 1.0, places=6)
+
     def test_converts_max_quaternion_and_scale_axis(self):
         quaternion = max_quaternion((1.0, 2.0, 3.0, 4.0))
         expected = np.asarray((4.0, -1.0, -2.0, -3.0), dtype=np.float64)
@@ -262,6 +462,160 @@ class AnimationTests(unittest.TestCase):
                     (0, 1, 1),
                 )
 
+    def test_summarizes_bounded_binary_evidence(self):
+        data = bytes(range(256))
+
+        summary = data_summary(data)
+
+        self.assertEqual(summary["length"], 256)
+        self.assertEqual(summary["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(
+            summary["hex"],
+            data[:128].hex(" "),
+        )
+
+    def test_pairs_derived_modifier_and_mod_app_slots(self):
+        modifiers = [
+            SimpleNamespace(types=0x100),
+            None,
+        ]
+        mod_apps = [
+            SimpleNamespace(types=0x2500),
+            SimpleNamespace(types=0x2500),
+        ]
+        base_object = SimpleNamespace(types=0x0914)
+        wrapper = SimpleNamespace(
+            types=0x2032,
+            children=mod_apps,
+        )
+
+        def summarize(chunk, _depth, _seen):
+            return None if chunk is None else {"type": chunk.types}
+
+        with (
+            patch(
+                "tools.inspect_max.import_max.get_references",
+                return_value=[*modifiers, base_object],
+            ),
+            patch("tools.inspect_max.import_max.get_guid", return_value=0),
+            patch("tools.inspect_max.chunk_summary", side_effect=summarize),
+        ):
+            stacks = derived_stack_summaries(wrapper, 4)
+
+        self.assertEqual(len(stacks), 1)
+        self.assertEqual(stacks[0]["slots"][0]["modifier"]["type"], 0x100)
+        self.assertEqual(stacks[0]["slots"][0]["mod_app"]["type"], 0x2500)
+        self.assertIsNone(stacks[0]["slots"][1]["modifier"])
+        self.assertEqual(
+            stacks[0]["base_object"]["type"],
+            base_object.types,
+        )
+
+    def test_decodes_editable_mesh_smoothing_groups(self):
+        face_flags = (7 << 16) | 5
+        data = struct.pack(
+            "<6I",
+            1,
+            0,
+            1,
+            2,
+            0x80000001,
+            face_flags,
+        )
+
+        faces, materials, smoothing = get_mesh_polys(data)
+
+        np.testing.assert_array_equal(faces, ((0, 1, 2),))
+        np.testing.assert_array_equal(materials, (7,))
+        np.testing.assert_array_equal(smoothing, (0x80000001,))
+
+    def test_decodes_editable_poly_smoothing_groups(self):
+        data = struct.pack(
+            "<5IHI",
+            1,
+            3,
+            0,
+            1,
+            2,
+            0x10,
+            0x40000002,
+        )
+        points = calc_point_3d(Chunk(0x011A, data=data))
+        mesh = Mesh3d()
+        mesh.set(points)
+
+        self.assertEqual(mesh.faces, [(0, 1, 2)])
+        self.assertEqual(mesh.smoothing, [0x40000002])
+
+    def test_applies_smoothing_groups_to_blender_edges_and_normals(self):
+        vertices = np.asarray(
+            (
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+            ),
+            dtype=np.float32,
+        )
+        faces = [(0, 1, 2), (0, 3, 1)]
+
+        smooth_shape = draw_shape(
+            "OverlappingGroups",
+            SimpleNamespace(verts=vertices),
+            faces,
+        )
+        apply_smoothing_groups(smooth_shape, (1, 3))
+        smooth_shape.update()
+
+        split_shape = draw_shape(
+            "DisjointGroups",
+            SimpleNamespace(verts=vertices),
+            faces,
+        )
+        apply_smoothing_groups(split_shape, (0x80000001, 2))
+        split_shape.update()
+
+        flat_shape = draw_shape(
+            "ZeroGroup",
+            SimpleNamespace(verts=vertices),
+            faces,
+        )
+        apply_smoothing_groups(flat_shape, (0, 1))
+
+        def shared_edge(shape):
+            return next(
+                edge
+                for edge in shape.edges
+                if set(edge.vertices) == {0, 1}
+            )
+
+        self.assertFalse(shared_edge(smooth_shape).use_edge_sharp)
+        self.assertTrue(shared_edge(split_shape).use_edge_sharp)
+        self.assertTrue(shared_edge(flat_shape).use_edge_sharp)
+        self.assertTrue(all(polygon.use_smooth for polygon in split_shape.polygons))
+        self.assertFalse(flat_shape.polygons[0].use_smooth)
+
+        stored = np.empty(2, dtype=np.int32)
+        split_shape.attributes["max_smoothing_group"].data.foreach_get(
+            "value",
+            stored,
+        )
+        np.testing.assert_array_equal(
+            stored.view(np.uint32),
+            (0x80000001, 2),
+        )
+
+        smooth_normals = [
+            smooth_shape.corner_normals[0].vector,
+            smooth_shape.corner_normals[3].vector,
+        ]
+        split_normals = [
+            split_shape.corner_normals[0].vector,
+            split_shape.corner_normals[3].vector,
+        ]
+        np.testing.assert_allclose(smooth_normals[0], smooth_normals[1])
+        self.assertLess(split_normals[0].dot(split_normals[1]), 0.1)
+
     def test_samples_frames_and_writes_layered_action(self):
         position = Chunk(
             0x2008,
@@ -270,7 +624,7 @@ class AnimationTests(unittest.TestCase):
                     0x2524,
                     data=key_data(
                         56,
-                        [(0, (0.0, 0.0, 0.0)), (320, (2.0, 0.0, 0.0))],
+                        [(0, (0.0, 0.0, 0.0)), (640, (2.0, 0.0, 0.0))],
                     ),
                 )
             },
@@ -290,8 +644,11 @@ class AnimationTests(unittest.TestCase):
             sampling="BAKE",
         )
 
-        np.testing.assert_allclose(samples.frames, (1.0, 2.0, 3.0))
-        np.testing.assert_allclose(samples.locations[:, 0], (0.0, 1.0, 2.0))
+        np.testing.assert_allclose(samples.frames, (1.0, 2.0, 3.0, 4.0, 5.0))
+        np.testing.assert_allclose(
+            samples.locations[:, 0],
+            (0.0, 0.3125, 1.0, 1.6875, 2.0),
+        )
 
         obj = bpy.data.objects.new("Animated", None)
         bpy.context.scene.collection.objects.link(obj)
@@ -305,7 +662,7 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(len(channelbag.fcurves), 10)
         self.assertEqual(
             sum(len(fcurve.keyframe_points) for fcurve in channelbag.fcurves),
-            30,
+            50,
         )
 
 

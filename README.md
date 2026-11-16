@@ -17,6 +17,9 @@ texture discovery, and researcher-facing format documentation.
 - Box, sphere, cylinder, torus, cone, and plane primitives.
 - Object names, hierarchy, pivots, object offsets, UV maps, and per-face
   material IDs.
+- Editable Mesh and Editable Poly smoothing masks, preserved as the
+  `max_smoothing_group` face attribute and reconstructed as Blender smooth
+  faces, sharp edges, and split normals.
 - Camera, camera-target, omni-light, and direct-light reconstruction,
   including camera look-at constraints.
 
@@ -45,7 +48,8 @@ texture discovery, and researcher-facing format documentation.
 ### Animation and Blender integration
 
 - Linear Position/Rotation/Scale, legacy and modern Bezier Position/Scale, and
-  TCB Position/Rotation/Scale key layouts.
+  TCB Position/Rotation/Scale key layouts, including Bezier tangent and TCB
+  parameter evaluation during baked sampling.
 - Scene FPS and active-frame-range decoding from the MAX `Config` stream.
 - Source-key and baked-per-frame sampling modes.
 - One Blender 5.2 layered/slotted Action per imported MAX file, with one slot
@@ -62,9 +66,14 @@ Support is necessarily class- and version-specific.
 
 - Unsupported or unknown plug-in object classes are skipped with a console
   diagnostic.
-- Skin weights, modifier stacks, morph targets, explicit vertex normals,
-  smoothing groups, splines, particles, and renderer proxies are not yet
-  reconstructed.
+- Modifier stacks are unwrapped to their base geometry but not evaluated; the
+  discarded modifiers are reported in the console.
+- Native Skin and Character Studio Physique weights, morph targets, authored
+  explicit vertex normals, splines, particles, and renderer proxies are not
+  yet reconstructed.
+- Smoothing-derived normals are supported for the confirmed Editable Mesh and
+  Editable Poly layouts. Authored normal specifications and the Edit Normals
+  modifier are not decoded.
 - Character Studio Biped objects can appear as hierarchy helpers, but they are
   not converted into a complete Blender armature and skin.
 
@@ -74,9 +83,11 @@ Support is necessarily class- and version-specific.
   detected but not decoded.
 - General constraints, procedural controllers, and unsupported controller
   classes are not reconstructed.
-- Bezier and TCB key values and timing are imported, but their tangent/TCB
-  fields are not evaluated yet; interpolation is approximated with linear
-  vectors and quaternion slerp.
+- **Source Keys** writes only native key times with linear Blender
+  interpolation; use **Bake Every Frame** to reproduce evaluated Bezier and
+  TCB curve shapes.
+- Weighted Bezier handle lengths and TCB rotation metadata for
+  multi-revolution segments are not evaluated yet.
 - Animated scale-axis shear is decomposed into Blender location, quaternion,
   and scale channels. Static scale-axis matrices retain the full affine
   transform.
@@ -121,8 +132,10 @@ The Python operator is `bpy.ops.import_scene.blender_max`.
 - **Apply Matrix** applies MAX object/pivot transforms.
 - **Transform Animation** enables supported PRS animation.
 - **Sampling**
-  - **Bake Every Frame** gives reliable quaternion playback.
-  - **Source Keys** creates smaller actions at native key times.
+  - **Bake Every Frame** evaluates supported Bezier and TCB curves and gives
+    reliable quaternion playback.
+  - **Source Keys** creates smaller actions at native key times, with linear
+    interpolation between the written keys.
 - **Use Scene FPS** reads the frame rate and active range from the MAX Config
   stream.
 - **Source FPS** is the fallback when scene timing is unavailable or disabled;
@@ -144,13 +157,13 @@ The Python operator is `bpy.ops.import_scene.blender_max`.
   dist\blender_max-2.0.1.zip
 ```
 
-`tools\inspect_max.py` can dump scene-node and controller evidence for format
-research:
+`tools\inspect_max.py` can dump bounded scene-node, geometry, modifier, and
+controller evidence for format research:
 
 ```powershell
 & "D:\Blender Foundation\Blender 5.2\blender.exe" `
   --background --factory-startup `
-  --python tools\inspect_max.py -- input.max --output controllers.json
+  --python tools\inspect_max.py -- input.max --output scene.inspect.json
 ```
 
 ## Credits and license

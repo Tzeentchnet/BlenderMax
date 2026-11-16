@@ -82,6 +82,9 @@ COPHY_MTL = 0x871517206912AB89  # CoronaPhysicalMtl
 SURF_MTL = 0x62F74B4C7E73161F  # Standard Surface
 SKIN_MTL = 0x44CFDE95bEC41C73  # CoronaSkinMtl
 HAIR_MTL = 0xCA41F54622C05DD6  # CoronaHairMtl
+SKIN_MODIFIER = 0x000156660095C6A3
+PHYSIQUE_MODIFIER = 0x0000000000000100
+EDIT_NORMALS_MODIFIER = 0x35CA1CDE4AA52AE3
 RAYT_MTL = 0x329B106E27190FF4  # RaytraceMtl
 PHYS_MTL = 0xDEADC0013D6B1CEC  # PhysicalMtl
 CORO_MTL = 0x448931DD70BE6506  # CoronaMtl
@@ -780,6 +783,7 @@ class Mesh3d(object):
         self.uvids = []
         self.maps = []
         self.mats = []
+        self.smoothing = []
         self.points = None
         self.tris = None
 
@@ -796,6 +800,7 @@ class Mesh3d(object):
             key = point.group
             self.mats.append(key)
             self.faces.append(ply)
+            self.smoothing.append(point.flag3)
 
 
 class Point3d(object):
@@ -1114,14 +1119,18 @@ def get_point_array(values):
 def get_mesh_polys(data):
     count, offset = get_long(data, 0)
     dtype = np.dtype({
-        "names": ("vertices", "edge", "flag", "material"),
+        "names": ("vertices", "smoothing", "flags", "material"),
         "formats": (("<u4", 3), "<u4", "<u2", "<u2"),
         "offsets": (0, 12, 16, 18),
         "itemsize": 20,
     })
     available = (len(data) - offset) // dtype.itemsize
     records = np.frombuffer(data, dtype=dtype, count=min(count, available), offset=offset)
-    return records["vertices"], records["material"].astype(np.int32)
+    return (
+        records["vertices"],
+        records["material"].astype(np.int32),
+        records["smoothing"].astype(np.uint32),
+    )
 
 
 def get_face_chunks(chunk):
@@ -2044,6 +2053,57 @@ def draw_shape(name, mesh, faces):
     return shape
 
 
+def apply_smoothing_groups(shape, smoothing_groups):
+    groups = np.asarray(smoothing_groups, dtype=np.uint32).reshape(-1)
+    if not len(groups):
+        return shape
+    if len(groups) != len(shape.polygons):
+        raise ValueError(
+            "smoothing group count %d does not match polygon count %d"
+            % (len(groups), len(shape.polygons))
+        )
+
+    attribute = shape.attributes.new(
+        name="max_smoothing_group",
+        type='INT',
+        domain='FACE',
+    )
+    attribute.data.foreach_set("value", groups.view(np.int32))
+    shape.polygons.foreach_set("use_smooth", groups != 0)
+    shape.update(calc_edges=True)
+
+    edge_groups = {}
+    for polygon, group in zip(shape.polygons, groups):
+        vertices = tuple(polygon.vertices)
+        for index, first in enumerate(vertices):
+            second = vertices[(index + 1) % len(vertices)]
+            edge = (min(first, second), max(first, second))
+            edge_groups.setdefault(edge, []).append(int(group))
+
+    sharp_edges = set()
+    for edge, adjacent in edge_groups.items():
+        for first_index, first_group in enumerate(adjacent):
+            if any(
+                first_group == 0
+                or second_group == 0
+                or not (first_group & second_group)
+                for second_group in adjacent[first_index + 1:]
+            ):
+                sharp_edges.add(edge)
+                break
+
+    edge_sharp = np.fromiter(
+        (
+            (min(edge.vertices), max(edge.vertices)) in sharp_edges
+            for edge in shape.edges
+        ),
+        dtype=np.bool_,
+        count=len(shape.edges),
+    )
+    shape.edges.foreach_set("use_edge_sharp", edge_sharp)
+    return shape
+
+
 def draw_map(shape, uvmap, uvcoords, uvwids):
     uvlayer = shape.uv_layers.new(do_init=True)
     if (uvlayer):
@@ -2072,6 +2132,7 @@ def create_shape(context, settings, node, mesh, mat):
         for idx, uvm in enumerate(mesh.maps[:len(mesh.cords)]):
             meshobject = draw_map(meshobject, idx, mesh.cords[idx], mesh.uvids[idx])
     meshobject.validate()
+    apply_smoothing_groups(meshobject, mesh.smoothing)
     meshobject.update()
     obj = bpy.data.objects.new(meshname, meshobject)
     context.view_layer.active_layer_collection.collection.objects.link(obj)
@@ -2163,7 +2224,9 @@ def create_editable_mesh(context, settings, node, msh, mat):
         faceid_chunk = meshchunk.get_first(0x0912)
         if (vertex_chunk and faceid_chunk):
             editmesh.verts = get_point_array(vertex_chunk.data)
-            editmesh.faces, editmesh.mats = get_mesh_polys(faceid_chunk.data)
+            editmesh.faces, editmesh.mats, editmesh.smoothing = get_mesh_polys(
+                faceid_chunk.data
+            )
             for chunk in meshchunk.children:
                 if (chunk.types in {0x0924, 0x0959}):
                     editmesh.maps.append(get_long(chunk.data, 0)[0])
@@ -2179,6 +2242,26 @@ def create_shell(context, settings, node, shell, mat, mtx):
     refs = get_references(shell)
     created = []
     if refs:
+        modifiers = [ref for ref in refs[:-1] if ref is not None]
+        if modifiers:
+            labels = []
+            for modifier in modifiers:
+                uid = get_guid(modifier)
+                if uid == SKIN_MODIFIER:
+                    labels.append("Skin weights")
+                elif (
+                    uid == PHYSIQUE_MODIFIER
+                    and get_super_id(modifier) == 0x810
+                ):
+                    labels.append("Physique weights")
+                elif uid == EDIT_NORMALS_MODIFIER:
+                    labels.append("Edit Normals")
+                else:
+                    labels.append(get_cls_name(modifier))
+            print(
+                "\tModifierWarning: importing base geometry without applying %s"
+                % ", ".join(labels)
+            )
         msh = refs[-1]
         created, uid = create_mesh(context, settings, node, msh, mat, mtx)
     return created

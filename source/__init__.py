@@ -96,10 +96,10 @@ class ImportBlenderMax(bpy.types.Operator, ImportHelper):
     )
     animation_sampling: EnumProperty(
         name="Sampling",
-        description="Choose whether to preserve source key times or bake every frame",
+        description="Choose curve-preserving baked samples or smaller linear source-key actions",
         items=(
-            ('BAKE', "Bake Every Frame", "Sample transforms every source frame for reliable quaternion playback"),
-            ('KEYS', "Source Keys", "Import only source key times for smaller actions"),
+            ('BAKE', "Bake Every Frame", "Evaluate supported Bezier and TCB curves every source frame"),
+            ('KEYS', "Source Keys", "Import source key times with linear segments for smaller actions"),
         ),
         default='BAKE',
     )

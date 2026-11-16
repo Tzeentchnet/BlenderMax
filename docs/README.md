@@ -59,7 +59,7 @@ ID.
 - [`source/max_animation.py`](../source/max_animation.py) contains the
   controller key layouts and transform sampling logic.
 - [`tools/inspect_max.py`](../tools/inspect_max.py) emits bounded JSON evidence
-  for scene nodes and controller graphs.
+  for scene nodes, geometry, modifier stacks, and controller graphs.
 - [`tests/test_max_animation.py`](../tests/test_max_animation.py) contains
   executable examples of confirmed record layouts and transform conversions.
 

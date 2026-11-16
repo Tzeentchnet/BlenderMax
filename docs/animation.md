@@ -143,23 +143,36 @@ offset  size  type       meaning
 8       ...              value
 ```
 
-The flags and trailing tangent/TCB fields are preserved only implicitly in the
-source bytes; the current importer does not evaluate them.
+The key flags and corroborated interpolation fields are decoded with the key
+value. For Bezier keys, outgoing tangent-type bits `10..12` select a step
+segment when their value is `2`.
 
 ### Supported key layouts
 
-| Chunk | Track | Record bytes | Value at offset 8 |
-|---:|---|---:|---|
-| `0x2513` | Linear Position | 20 | `float32[3]` |
-| `0x2521` | TCB Position | 64 | `float32[3]` |
-| `0x2524` | Legacy Bezier Position | 56 | `float32[3]` |
-| `0x2526` | Bezier Position | 80 | `float32[3]` |
-| `0x2514` | Linear Rotation | 24 | `float32[4]` quaternion |
-| `0x2522` | TCB Rotation | 92 | `float32[4]` quaternion |
-| `0x2515` | Linear Scale | 36 | `float32[7]` scale/axis |
-| `0x2523` | TCB Scale | 112 | `float32[7]` scale/axis |
-| `0x2519` | Legacy Bezier Scale | 92 | `float32[7]` scale/axis |
-| `0x2528` | Bezier Scale | 148 | `float32[7]` scale/axis |
+| Chunk | Track | Record bytes | Value at offset 8 | Curve fields |
+|---:|---|---:|---|---|
+| `0x2513` | Linear Position | 20 | `float32[3]` | None |
+| `0x2521` | TCB Position | 64 | `float32[3]` | TCB at 20 |
+| `0x2524` | Legacy Bezier Position | 56 | `float32[3]` | In/out tangents at 20/32 |
+| `0x2526` | Bezier Position | 80 | `float32[3]` | In/out tangents at 20/32 |
+| `0x2514` | Linear Rotation | 24 | `float32[4]` quaternion | None |
+| `0x2522` | TCB Rotation | 92 | `float32[4]` quaternion | TCB at 24 |
+| `0x2515` | Linear Scale | 36 | `float32[7]` scale/axis | None |
+| `0x2523` | TCB Scale | 112 | `float32[7]` scale/axis | TCB at 36 |
+| `0x2519` | Legacy Bezier Scale | 92 | `float32[7]` scale/axis | In/out tangents at 36/64 |
+| `0x2528` | Bezier Scale | 148 | `float32[7]` scale/axis | In/out tangents at 36/64 |
+
+Every TCB block is five `float32` values in this order:
+
+```text
+tension, continuity, bias, ease-in, ease-out
+```
+
+Bezier position tangents are value units per MAX tick. Bezier scale tangents
+use value units per second. The evaluator converts both to cubic control
+points for the segment duration. Remaining record fields include caches and,
+for some Bezier variants, weighted-handle data whose semantics are not yet
+fully reconstructed.
 
 A payload must be an exact multiple of its record size. Rejecting malformed
 lengths prevents one incorrect layout guess from shifting every later key.
@@ -192,8 +205,14 @@ Implausible FPS values and reversed ranges are rejected.
 
 BlenderMax currently evaluates:
 
-- Position and scale by component-wise linear interpolation.
-- Rotation by quaternion spherical interpolation.
+- Linear position and scale by component-wise linear interpolation.
+- Bezier position and scale with cubic control points reconstructed from the
+  stored incoming and outgoing tangent slopes. Step outgoing tangents hold the
+  preceding value.
+- TCB position and scale with non-uniform Hermite tangents derived from
+  tension, continuity, and bias, plus the stored ease-in/ease-out time warp.
+- Linear rotation with quaternion spherical interpolation and TCB rotation
+  with spherical quadrangle interpolation using TCB-derived controls.
 - Missing components from the static source transform.
 - Source-key sampling at the union of animated component key times, or baked
   sampling at every source frame.
@@ -209,13 +228,19 @@ Successive output quaternions are sign-adjusted when their dot product is
 negative, avoiding discontinuities caused by equivalent `q` and `-q`
 representations.
 
-### Fidelity limitation
+### Fidelity limitations
 
-TCB and Bezier trailing fields are not evaluated yet. Their values are sampled
-with linear vector interpolation or quaternion slerp, so timing is preserved
-but the original curve shape can differ. A future decoder should determine
-the trailing-field layout separately for each record size before changing
-interpolation.
+**Bake Every Frame** evaluates the supported Bezier and TCB fields before
+writing Blender keys. **Source Keys** intentionally writes only the native key
+times and uses linear Blender interpolation, so it preserves values and timing
+but not nonlinear segment shapes.
+
+Weighted Bezier handle-length fields are not applied. TCB rotation currently
+uses the absolute key quaternions; the stored relative angle-axis metadata
+needed to retain explicit multi-revolution segments is not evaluated. For
+animated scale, tangent/TCB interpolation applies to the three scale values;
+the scale-axis quaternion follows the eased segment parameter before Blender
+matrix decomposition.
 
 ## Character Studio Biped
 
@@ -230,8 +255,8 @@ would produce plausible but invalid motion.
 
 ## Research priorities
 
-1. Decode Bezier tangent fields for each legacy and modern record size.
-2. Decode TCB tension, continuity, bias, ease-to, and ease-from fields.
+1. Decode and validate weighted Bezier handle lengths.
+2. Preserve TCB rotation relative angle-axis and multi-revolution segments.
 3. Establish active-controller selection rules for list controllers.
 4. Map additional constraint classes and their target/reference slots.
 5. Characterize Biped subanimation framing with controlled synthetic files.

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-"""Inspect scene nodes and transform controllers in a native MAX file.
+"""Inspect scene nodes, geometry, modifiers, and controllers in a native MAX file.
 
 Run with Blender:
     blender --background --factory-startup --python tools/inspect_max.py -- input.max
@@ -9,6 +9,7 @@ Run with Blender:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -20,6 +21,11 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from source import import_max  # noqa: E402
+
+
+BYTE_PREFIX_LENGTH = 128
+DERIVED_OBJECT_TYPES = {0x2032, 0x2033}
+DERIVED_OBJECT_GUIDS = {0x405F22F529263A68}
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +44,8 @@ def data_summary(data: Any) -> dict[str, Any]:
         return {
             "kind": "bytes",
             "length": len(data),
-            "hex": data[:64].hex(" "),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "hex": data[:BYTE_PREFIX_LENGTH].hex(" "),
         }
     if isinstance(data, str):
         return {"kind": "string", "value": data}
@@ -61,6 +68,7 @@ def chunk_summary(chunk: Any, depth: int, seen: set[int]) -> dict[str, Any] | No
     result = {
         "type": f"0x{chunk.types:04X}",
         "guid": f"0x{import_max.get_guid(chunk):016X}",
+        "super_id": f"0x{import_max.get_super_id(chunk):08X}",
         "class": import_max.get_cls_name(chunk),
         "data": data_summary(chunk.data),
     }
@@ -85,6 +93,64 @@ def chunk_summary(chunk: Any, depth: int, seen: set[int]) -> dict[str, Any] | No
             for reference in references
         ]
     return result
+
+
+def derived_stack_summaries(
+    mesh: Any,
+    max_depth: int,
+) -> list[dict[str, Any]]:
+    stacks = []
+    seen = set()
+    wrapper = mesh
+    while (
+        wrapper is not None
+        and (
+            wrapper.types in DERIVED_OBJECT_TYPES
+            or import_max.get_guid(wrapper) in DERIVED_OBJECT_GUIDS
+        )
+        and id(wrapper) not in seen
+    ):
+        seen.add(id(wrapper))
+        references = import_max.get_references(wrapper)
+        if not references:
+            break
+
+        modifiers = references[:-1]
+        mod_apps = [
+            child
+            for child in getattr(wrapper, "children", ())
+            if child.types == 0x2500
+        ]
+        slots = []
+        for index in range(max(len(modifiers), len(mod_apps))):
+            modifier = modifiers[index] if index < len(modifiers) else None
+            mod_app = mod_apps[index] if index < len(mod_apps) else None
+            slots.append(
+                {
+                    "index": index,
+                    "modifier": chunk_summary(
+                        modifier,
+                        max_depth,
+                        set(),
+                    ),
+                    "mod_app": chunk_summary(
+                        mod_app,
+                        max_depth,
+                        set(),
+                    ),
+                }
+            )
+
+        base_object = references[-1]
+        stacks.append(
+            {
+                "wrapper": chunk_summary(wrapper, 0, set()),
+                "slots": slots,
+                "base_object": chunk_summary(base_object, 0, set()),
+            }
+        )
+        wrapper = base_object
+    return stacks
 
 
 def inspect_scene(path: Path, max_depth: int) -> dict[str, Any]:
@@ -114,6 +180,11 @@ def inspect_scene(path: Path, max_depth: int) -> dict[str, Any]:
                     "transform": chunk_summary(prs, max_depth, set()),
                     "mesh_guid": (
                         f"0x{import_max.get_guid(mesh):016X}" if mesh else None
+                    ),
+                    "mesh": chunk_summary(mesh, max_depth, set()),
+                    "derived_stacks": derived_stack_summaries(
+                        mesh,
+                        max_depth,
                     ),
                     "material_guid": (
                         f"0x{import_max.get_guid(material):016X}"

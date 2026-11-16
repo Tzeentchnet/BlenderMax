@@ -19,9 +19,11 @@ The JSON report includes:
 - Number of top-level Scene chunks.
 - Scene nodes resolved to superclass ID `0x1`.
 - Node name, parent, class ID, mesh class, material class, and layer class.
-- Transform-controller children and references.
+- Geometry, modifier, and transform-controller children and references.
 - Primitive data summaries.
-- At most the first 64 bytes of an opaque byte payload.
+- SHA-256 and at most the first 128 bytes of an opaque byte payload.
+- Derived-object modifier references paired positionally with orphaned
+  `0x2500` ModApp slots.
 - Cycle markers when a reference graph points back to an object already seen.
 
 Increasing `--max-depth` can grow reports quickly. Start at two or three and
@@ -53,6 +55,9 @@ Useful single-variable experiments include:
 - One key added at a known tick.
 - One controller changed from Linear to TCB or Bezier.
 - One Multi/Sub-Object material ID made sparse.
+- Two adjacent faces assigned overlapping, disjoint, and zero smoothing masks.
+- One face-corner normal made explicit and rotated to a known vector.
+- One vertex weighted 100% to one bone, then 75/25 to two bones.
 
 For version research, create the same minimal scene in each available release.
 Do not compare unrelated production files and attribute every difference to
@@ -139,6 +144,10 @@ For a geometry decoder, verify at least:
 - Winding on both ordinary and mirrored transforms.
 - Per-face material IDs, including sparse Multi/Sub IDs.
 - UV channel count and per-loop coordinates.
+- Per-face smoothing masks, smooth polygons, sharp shared edges, and resulting
+  corner normals.
+- Bone identities, per-vertex influence counts, normalized weights, and
+  unweighted vertices when testing a skin decoder.
 - Object pivot and parent transform.
 
 A scene that opens without an exception is not sufficient evidence. A wrong
@@ -159,8 +168,10 @@ For an animation decoder, verify:
 - Duplicate-time behavior.
 - Curve values between keys, not only at keys.
 
-Until tangent fields are decoded, describe Bezier and TCB support as key-value
-support rather than exact curve reconstruction.
+Describe curve reconstruction as exact only for corroborated fields. The
+current baked evaluator covers Bezier tangent slopes and TCB
+tension/continuity/bias/ease, but not weighted Bezier handle lengths or TCB
+multi-revolution rotation metadata.
 
 ## Handling unknown data
 
@@ -175,6 +186,36 @@ Prefer an explicit unknown over a guessed value:
 
 This discipline is especially important for plug-in classes whose parameter
 blocks can change independently of the 3ds Max release.
+
+## Evidence required for Skin and explicit normals
+
+Native Skin (`0x000156660095C6A3`) and Character Studio Physique are distinct
+modifier classes with distinct local-data formats. Physique is class
+`(0x100, 0)` with superclass `0x810`; its documented `0x2506 -> 0x0989`
+records must not be used to infer native Skin. A minimum authorized Skin
+comparison set is:
+
+1. A mesh and bone hierarchy without Skin.
+2. The same mesh with one vertex weighted 100% to one bone.
+3. The same mesh with one vertex weighted 75/25 to two bones.
+
+Keep topology, names, bind transforms, modifier settings, and save version
+identical. Record the derived-wrapper references and each corresponding
+`0x2500` ModApp container, especially the `0x2512` subtree.
+
+For explicit normals, use a minimal triangle or cube:
+
+1. Save a baseline with default normals.
+2. Add Edit Normals without changing a direction.
+3. Rotate exactly one face-corner normal to a known unit vector and save
+   again.
+
+Record whether the change appears in the Edit Normals ModApp's poly-mesh
+`0x0240` or tri-mesh `0x0250` payload. Chunk `0x0260` bit `0x08` identifies
+tri-mesh mode; its lower three bits are transient undo markers. A valid
+decoder must establish normal-vector storage, explicit/specified flags,
+per-face-corner normal IDs, and version boundaries before calling Blender's
+custom split-normal API.
 
 ## Legal and privacy considerations
 

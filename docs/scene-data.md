@@ -69,20 +69,21 @@ float32 positions[count][3]
 
 The decoder caps `count` to the complete records available.
 
-### Faces and material IDs: `0x0912`
+### Faces, smoothing groups, and material IDs: `0x0912`
 
 The payload begins with a `uint32` count followed by 20-byte records:
 
 ```text
-offset  size  type       current meaning
+offset  size  type       meaning
 0       12    uint32[3]  vertex indices
-12      4     uint32     edge/visibility data
-16      2     uint16     face flags
-18      2     uint16     face material ID
+12      4     uint32     smoothing-group mask
+16      4     uint32     face flags; material ID occupies bits 16-31
 ```
 
-Vertex indices and material IDs are **confirmed**. The detailed bit meanings
-of the edge and flag fields are not yet documented.
+Vertex indices, the smoothing mask, and the material ID are **confirmed**.
+BlenderMax currently reads the low and high halves of the last word as
+`uint16` face flags and material ID respectively. The detailed meanings of the
+low flag bits are not yet documented.
 
 ### Mapping channels
 
@@ -108,7 +109,7 @@ their topology is distributed across different child chunks.
 | `0x0108` | Variable-length polygon-loop records | Tentative |
 | `0x010A` | Triangle-index array; first `uint32` is treated as an end offset | Confirmed for known variants |
 | `0x0118` | Face container | Confirmed |
-| `0x011A` | Variable point/topology records with flags and material group | Tentative |
+| `0x011A` | Variable point/topology records with flags, material group, and smoothing mask | Corroborated |
 | `0x0124` | Mapping-channel number | Confirmed |
 | `0x0128` | Mapping coordinates as packed `float32[3]` | Confirmed |
 | `0x012B` | Variable-length per-face mapping indices | Confirmed for known variants |
@@ -137,13 +138,150 @@ if flags & 0x01:
 if flags & 0x08:
     uint16 material_group
 if flags & 0x10:
-    uint32 flag3
+    uint32 smoothing_group
 if flags & 0x20:
     uint32 extra_bits[2 * (point_index_count - 3)]
 ```
 
-The conditional layout is observed, but the semantic names of the flag fields
-are placeholders. `material_group` is used as a face material ID.
+`material_group` is used as a face material ID. The `flags & 0x10` value is
+the face's smoothing-group mask. The meanings of `flag1`, `flag2`, and
+`extra_bits` remain tentative.
+
+## Smoothing groups and generated normals
+
+3ds Max stores a 32-bit mask on each face. A zero mask makes that face flat.
+Two adjacent nonzero faces smooth across their shared edge when their masks
+overlap:
+
+```text
+(face_a_smoothing & face_b_smoothing) != 0
+```
+
+BlenderMax preserves the original bit pattern in the signed 32-bit
+`max_smoothing_group` face attribute. Masks with bit 31 set appear negative
+through Blender's signed integer API, but the bits are unchanged.
+
+For shading, every nonzero face is marked smooth. An edge is marked sharp when
+either adjacent face has group zero or the adjacent masks do not overlap.
+Boundary edges are left unmarked; the owning face's smooth/flat setting
+controls them. A nonmanifold edge is sharp if any adjacent pair is
+incompatible. Blender then derives per-corner split normals from these face
+and edge settings.
+
+This reconstructs normals implied by smoothing groups. It does not decode
+authored `MeshNormalSpec`/`MNNormalSpec` data or apply the Edit Normals
+modifier.
+
+### Modifier-local smoothing changes
+
+The base-object masks above are not the only smoothing data that can affect
+the evaluated mesh. The externally documented Edit Mesh ModApp format reports
+these additional records:
+
+| Format | Chunk | Layout |
+|---|---:|---|
+| Modern mesh delta | `0x0230` | Count followed by 12-byte `(face_index, mask, values)` records |
+| Legacy topology delta | `0x2840` | `uint32` smoothing masks, one per affected face |
+| Legacy compact form | `0x3040` | `int32 count`, `uint32 smoothing_mask` |
+
+The modern update is:
+
+```text
+new_group = (old_group & ~mask) | (values & mask)
+```
+
+In the legacy `0x2830` packed face-attribute stream, bit 28 means to apply
+the corresponding value from `0x2840`. BlenderMax does not yet evaluate Edit
+Mesh deltas, so these modifier-local changes are reported but not applied.
+
+## Derived objects and modifier data
+
+Object-space and world-space derived wrappers use fixed Scene chunk types
+`0x2032` and `0x2033`. The observed object-space wrapper class ID is
+`0x405F22F529263A68`. Its `0x2034` reference array stores modifiers in stack
+order followed by the base object. A parallel orphaned `0x2500` ModApp
+container exists for every modifier position, including modifiers with no
+local payload. The ModApp slots pair with modifier references by position.
+
+Common ModApp children are:
+
+| Chunk | Interpretation |
+|---:|---|
+| `0x2510` | 52-byte modifier-context transform: row-major `Matrix3` plus `uint32` state flags |
+| `0x2511` | Optional modifier-context bounding box |
+| `0x2512` | Modifier-specific payload |
+
+Relevant modifier class IDs are:
+
+| Combined class ID | Class |
+|---:|---|
+| `0x000156660095C6A3` | Native Skin |
+| `0x0000000000000100` with superclass `0x810` | Character Studio Physique |
+| `0x35CA1CDE4AA52AE3` | Edit Normals |
+
+BlenderMax currently imports the final base-object reference and emits a
+console diagnostic for every discarded modifier. It does not interpret
+native Skin's `0x2512` payload or create speculative vertex groups. Native
+Skin and Character Studio Physique use different formats and must not share a
+decoder merely because both represent deformation weights.
+
+### Edit Normals local data
+
+The Edit Normals modifier has one parameter-block reference. Its per-node
+ModApp payload distinguishes:
+
+| Chunk | Interpretation |
+|---:|---|
+| `0x0200` | Named normal-selection sets |
+| `0x0240` | Poly-mesh normal specification |
+| `0x0250` | Tri-mesh normal specification; mutually exclusive with `0x0240` |
+| `0x0260` | Flags; durable bit `0x08` selects tri-mesh mode |
+
+The low three bits of `0x0260` are transient undo state and should not be
+treated as durable file semantics. Cached meshes and in-progress editing
+buffers are not persisted. The internal normal vectors, specified/explicit
+flags, and per-face-corner normal IDs inside `0x0240` and `0x0250` remain
+externally encoded, so BlenderMax does not decode them.
+
+### Character Studio Physique weight records
+
+The draft Ryzom corpus report identifies a Physique-specific path:
+
+```text
+0x2500 ModApp
+  0x2512
+    0x2504 instance data
+      four header/state children
+      0x2506 per mesh vertex
+        0x0989 weight record
+```
+
+Each `0x0989` record is reported as `4 + 20 * influence_count` bytes:
+
+```text
+uint32 influence_count
+repeat influence_count times:
+    uint32 bone_reference
+    float32 bone_local_offset[3]
+    float32 weight
+```
+
+Records occur in mesh-vertex order. The Physique modifier object's own
+reference array is the bone-link table and can contain meaningful holes.
+Reported weights are not necessarily normalized; the evaluated result keeps
+at most four influences and normalizes their sum. Bone references use
+Physique link-tree encodings rather than direct Scene indices, including
+different negative rigid and positive cross-link forms.
+
+This is useful evidence for a future Physique decoder, but it does not unblock
+native Skin. BlenderMax also lacks the complete Biped-to-armature conversion
+needed to apply these weights reliably.
+
+These modifier observations are independently summarized from the draft
+[Ryzom Max Geometry Formats](https://wiki.ryzom.dev/drafts/max_geometry_formats)
+corpus report reviewed on 2026-11-16. They are treated as external
+corroboration rather than a 3ds Max specification and still require
+BlenderMax-controlled samples before implementation.
 
 ## Geometry semantics corroborated through the SDK
 
@@ -235,8 +373,11 @@ directory layout.
 
 ## Known gaps
 
-- Skin weights and modifier-stack serialization.
-- Explicit vertex normals and smoothing-group reconstruction for all variants.
+- Native Skin weights, bone reconstruction, and modifier-stack evaluation.
+- Character Studio Physique weights and link-tree/Biped reconstruction.
+- Authored explicit normals and Edit Normals modifier data.
+- Smoothing groups outside the confirmed Editable Mesh `0x0912` and Editable
+  Poly `0x011A` variants.
 - N-gon boundary and hidden-edge semantics in every Editable Poly version.
 - Multiple UV channels outside the currently observed mapping families.
 - Exact renderer-material parity.
