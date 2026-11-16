@@ -14,15 +14,13 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BLENDER = Path(r"D:\Blender Foundation\Blender 5.2\blender.exe")
-DEFAULT_CORPUS = Path(r"F:\ModelArchive\hl2\hl2")
-DEFAULT_OUTPUT = Path(r"E:\tests\BlenderMax\corpus")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--blender", type=Path, default=DEFAULT_BLENDER)
-    parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--corpus", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--manifest",
         type=Path,
