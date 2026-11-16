@@ -127,6 +127,13 @@ def scene_stats(elapsed_seconds: float) -> dict:
     }
 
 
+def validate_scene_stats(stats: dict) -> None:
+    if not stats["finite_transforms"]:
+        raise ValueError("Imported scene contains non-finite object transforms")
+    if stats["objects"] == 0:
+        raise ValueError("Importer produced an empty scene")
+
+
 def write_report(path: Path, report: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -163,10 +170,9 @@ def main() -> None:
         )
         if "FINISHED" not in result:
             raise RuntimeError("Importer returned %s" % sorted(result))
-
         report["scene"] = scene_stats(time.perf_counter() - started)
-        if not report["scene"]["finite_transforms"]:
-            raise ValueError("Imported scene contains non-finite object transforms")
+        report["scene"] = scene_stats(time.perf_counter() - started)
+        validate_scene_stats(report["scene"])
 
         args.output.parent.mkdir(parents=True, exist_ok=True)
         bpy.ops.wm.save_as_mainfile(filepath=str(args.output.resolve()))

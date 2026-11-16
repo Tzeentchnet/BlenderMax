@@ -560,10 +560,14 @@ class ImportMaxFile:
             filename = filename.split('/')
         node = self.root
         for name in filename:
-            for kid in node.kids:
-                if kid.name.lower() == name.lower():
-                    break
-            node = kid
+            node = next(
+                (kid for kid in node.kids if kid.name.casefold() == name.casefold()),
+                None,
+            )
+            if node is None:
+                raise FileNotFoundError(
+                    "MAX stream not found: %s" % "/".join(filename)
+                )
         return node.sid
 
     def openstream(self, filename):
@@ -953,10 +957,21 @@ def read_class_data(maxfile, filename):
 
 def read_class_directory(maxfile, filename):
     global CLS_DIR3_LIST
-    try:
-        CLS_DIR3_LIST = read_chunks(maxfile, 'ClassDirectory3', ContainerChunk, ClassIDChunk)
-    except:
-        CLS_DIR3_LIST = read_chunks(maxfile, 'ClassDirectory', ContainerChunk, ClassIDChunk)
+    for stream_name in ('ClassDirectory3', 'ClassDirectory2', 'ClassDirectory'):
+        try:
+            CLS_DIR3_LIST = read_chunks(
+                maxfile,
+                stream_name,
+                ContainerChunk,
+                ClassIDChunk,
+            )
+            break
+        except FileNotFoundError:
+            continue
+    else:
+        raise FileNotFoundError(
+            "MAX class directory stream not found in %s" % filename
+        )
     for clsdir in CLS_DIR3_LIST:
         clsdir.dll = get_dll(clsdir)
 

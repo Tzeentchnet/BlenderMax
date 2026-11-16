@@ -6,6 +6,8 @@ import struct
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import bpy
 import numpy as np
@@ -28,6 +30,7 @@ from source.max_animation import (  # noqa: E402
     max_scale_matrix,
     sample_transform,
 )
+from tools.blender_import import validate_scene_stats  # noqa: E402
 
 
 class Chunk:
@@ -106,6 +109,45 @@ class AnimationTests(unittest.TestCase):
         np.testing.assert_allclose(tracks.position.values[1], (1.0, 2.0, 3.0))
         np.testing.assert_allclose(tracks.rotation.values[0], (1.0, 0.0, 0.0, 0.0))
         np.testing.assert_allclose(tracks.scale.values[1, :3], (2.0, 2.0, 2.0))
+
+    def test_missing_ole_stream_raises_file_not_found(self):
+        maxfile = object.__new__(import_max.ImportMaxFile)
+        maxfile.root = SimpleNamespace(
+            sid=0,
+            name="Root Entry",
+            kids=[SimpleNamespace(sid=1, name="Scene", kids=[])],
+        )
+
+        self.assertEqual(maxfile._find("scene"), 1)
+        with self.assertRaisesRegex(FileNotFoundError, "ClassDirectory3"):
+            maxfile._find("ClassDirectory3")
+
+    def test_reads_legacy_class_directory_2(self):
+        class_directory = Chunk(0)
+        calls = []
+
+        def fake_read_chunks(_maxfile, name, *_args, **_kwargs):
+            calls.append(name)
+            if name == "ClassDirectory3":
+                raise FileNotFoundError(name)
+            return [class_directory]
+
+        previous = import_max.CLS_DIR3_LIST
+        self.addCleanup(setattr, import_max, "CLS_DIR3_LIST", previous)
+        with patch.object(import_max, "read_chunks", side_effect=fake_read_chunks):
+            import_max.read_class_directory(object(), "legacy.max")
+
+        self.assertEqual(calls, ["ClassDirectory3", "ClassDirectory2"])
+        self.assertIs(import_max.CLS_DIR3_LIST[0], class_directory)
+
+    def test_rejects_empty_corpus_imports(self):
+        with self.assertRaisesRegex(ValueError, "empty scene"):
+            validate_scene_stats(
+                {
+                    "finite_transforms": True,
+                    "objects": 0,
+                }
+            )
 
     def test_extracts_supported_modern_key_layouts(self):
         cases = (
