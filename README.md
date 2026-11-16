@@ -9,7 +9,9 @@ texture discovery, and a repeatable headless corpus runner.
 ## Highlights
 
 - Blender 5.2 extension package and file-handler integration.
-- Native OLE/MAX parsing without requiring an Autodesk 3ds Max installation.
+- Native OLE/MAX parsing without requiring an Autodesk 3ds Max installation,
+  including legacy `ClassDirectory`, `ClassDirectory2`, and `ClassDirectory3`
+  streams.
 - NumPy decoding for vertex, face, triangle, and UV buffers.
 - Blender bulk-data APIs for mesh positions, loops, polygons, UVs, material
   indices, and animation key coordinates.
@@ -48,6 +50,12 @@ Support is necessarily class- and version-specific.
 - Animated scale-axis shear is decomposed to Blender location, quaternion, and
   scale channels; static scale-axis matrices retain the full affine transform.
 
+## Format research
+
+Researcher-facing notes on the observed MAX container, chunk grammar, class
+indirection, scene data, geometry, materials, transforms, and animation are
+indexed in [docs/README.md](docs/README.md).
+
 ## Installation
 
 1. Build the extension:
@@ -59,7 +67,7 @@ Support is necessarily class- and version-specific.
    ```
 
 2. In Blender 5.2, open **Edit > Preferences > Get Extensions**, use
-   **Install from Disk**, and select `dist\blender_max-2.0.0.zip`.
+   **Install from Disk**, and select `dist\blender_max-2.0.1.zip`.
 3. Import a file with **File > Import > BlenderMax / Autodesk MAX (.max)**.
 
 The Python operator is `bpy.ops.import_scene.blender_max`.
@@ -81,41 +89,6 @@ The Python operator is `bpy.ops.import_scene.blender_max`.
   it converts 3ds Max ticks (4,800 per second) to Blender frames.
 - **Frame Offset** shifts imported animation in the Blender timeline.
 
-## HL2 corpus regression testing
-
-The corpus runner defaults to:
-
-- Blender: `D:\Blender Foundation\Blender 5.2\blender.exe`
-- Corpus: `F:\ModelArchive\hl2\hl2`
-- Results: `E:\tests\BlenderMax\corpus`
-
-Run the checked-in smoke manifest:
-
-```powershell
-python tools\run_corpus.py `
-  --manifest tests\corpus_smoke.txt `
-  --output E:\tests\BlenderMax\smoke
-```
-
-Run a deterministic size- and animation-stratified sample:
-
-```powershell
-python tools\run_corpus.py --limit 25
-```
-
-Run all MAX files:
-
-```powershell
-python tools\run_corpus.py --all --skip-existing
-```
-
-Each import produces:
-
-- `blend\...`: the imported `.blend` for visual review.
-- `reports\...`: object, geometry, material, image, action, and timing metrics.
-- `logs\...`: the complete Blender console log.
-- `summary.json`: aggregate pass/fail/timeout results.
-
 ## Development checks
 
 ```powershell
@@ -128,7 +101,7 @@ Each import produces:
 & "D:\Blender Foundation\Blender 5.2\blender.exe" -c extension build `
   --source-dir=source --output-dir=dist
 & "D:\Blender Foundation\Blender 5.2\blender.exe" -c extension validate `
-  dist\blender_max-2.0.0.zip
+  dist\blender_max-2.0.1.zip
 ```
 
 `tools\inspect_max.py` can dump scene-node and controller evidence for format

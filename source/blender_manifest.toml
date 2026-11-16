@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 id = "blender_max"
 name = "BlenderMax"
-version = "2.0.0"
+version = "2.0.1"
 tagline = "Modern Autodesk 3ds Max importer with materials and animation"
 maintainer = "BlenderMax contributors"
 type = "add-on"
