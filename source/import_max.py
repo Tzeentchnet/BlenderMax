@@ -22,10 +22,21 @@ import math
 import zlib
 import array
 import struct
+import traceback
 import mathutils
+import numpy as np
 from pathlib import Path
-from bpy_extras.image_utils import load_image
 from bpy_extras.node_shader_utils import PrincipledBSDFWrapper
+
+from .max_animation import (
+    TICKS_PER_SECOND,
+    ActionBuilder,
+    extract_transform_tracks,
+    max_quaternion,
+    max_scale_matrix,
+    sample_transform,
+)
+from .max_materials import TextureResolver, clear_texture_cache
 
 
 ###################
@@ -62,6 +73,10 @@ BIPED_ANIM = 0x78C6B2A6B147369  # Biped SubAnim
 EDIT_MESH = 0x00000000E44F10B3  # Editable Mesh
 EDIT_POLY = 0x192F60981BF8338D  # Editable Poly
 POLY_MESH = 0x000000005D21369A  # PolyMeshObject
+CAMERA = 0x0000000000001002  # Camera
+OMNI_LIGHT = 0x0000000000001011  # Omni
+DIRECT_LIGHT = 0x0000000000001013  # Free Direct
+CAMERA_TARGET = 0x0000000000001020  # Camera Target
 LAYER_MTL = 0x8425554E65486584  # CoronaLayeredMtl
 COPHY_MTL = 0x871517206912AB89  # CoronaPhysicalMtl
 SURF_MTL = 0x62F74B4C7E73161F  # Standard Surface
@@ -80,10 +95,6 @@ PLANE = 0x77566F65081F1DFC  # Plane
 CONE = 0x00000000A86C23DD  # Cone
 
 SKIPPABLE = {
-    0x0000000000001002: 'Camera',
-    0x0000000000001011: 'Omni',
-    0x0000000000001013: 'Free Direct',
-    0x0000000000001020: 'Camera Target',
     0x0000000000001040: 'Line',
     0x0000000000001065: 'Rectangle',
     0x0000000000001097: 'Ellipse',
@@ -109,6 +120,7 @@ SCENE_LIST = []
 object_list = []
 parent_dict = {}
 matrix_dict = {}
+target_dict = {}
 
 
 def get_valid_name(name):
@@ -954,6 +966,39 @@ def read_config(maxfile, filename):
     CONFIG = read_chunks(maxfile, 'Config', superId=7)
 
 
+def get_scene_timing():
+    timing = {
+        "fps": None,
+        "start_tick": None,
+        "end_tick": None,
+        "current_tick": None,
+    }
+    root = next((chunk for chunk in CONFIG if chunk.types == 0x20B0), None)
+    if root is None:
+        return timing
+
+    for name, chunk_type in (
+        ("fps", 0x0010),
+        ("start_tick", 0x0050),
+        ("end_tick", 0x0060),
+        ("current_tick", 0x0070),
+    ):
+        chunk = root.get_first(chunk_type)
+        if chunk is not None and isinstance(chunk.data, bytes) and len(chunk.data) >= 4:
+            timing[name] = struct.unpack_from("<i", chunk.data)[0]
+
+    if timing["fps"] is not None and not 1 <= timing["fps"] <= 1000:
+        timing["fps"] = None
+    if (
+        timing["start_tick"] is not None
+        and timing["end_tick"] is not None
+        and timing["start_tick"] > timing["end_tick"]
+    ):
+        timing["start_tick"] = None
+        timing["end_tick"] = None
+    return timing
+
+
 def read_directory(maxfile, filename):
     global DLL_DIR_LIST
     DLL_DIR_LIST = read_chunks(maxfile, 'DllDirectory', ContainerChunk, DirectoryChunk)
@@ -965,22 +1010,27 @@ def read_video_postqueue(maxfile, filename):
 
 
 def calc_point(data):
-    points = []
-    long, offset = get_long(data, 0)
-    while (offset < len(data)):
-        val, offset = get_long(data, offset)
-        flt, offset = get_floats(data, offset, 3)
-        points.extend(flt)
-    return points
+    count, offset = get_long(data, 0)
+    dtype = np.dtype({
+        "names": ("index", "point"),
+        "formats": ("<u4", ("<f4", 3)),
+        "offsets": (0, 4),
+        "itemsize": 16,
+    })
+    available = (len(data) - offset) // dtype.itemsize
+    records = np.frombuffer(data, dtype=dtype, count=min(count, available), offset=offset)
+    return records["point"].reshape(-1)
 
 
 def calc_point_float(data):
-    points = []
-    long, offset = get_long(data, 0)
-    while (offset < len(data)):
-        flt, offset = get_floats(data, offset, 3)
-        points.extend(flt)
-    return points
+    count, offset = get_long(data, 0)
+    available = (len(data) - offset) // 12
+    return np.frombuffer(
+        data,
+        dtype="<f4",
+        count=min(count, available) * 3,
+        offset=offset,
+    )
 
 
 def calc_point_3d(chunk):
@@ -1034,28 +1084,29 @@ def get_point_3d(chunk, default=0.0):
 
 
 def get_point_array(values):
-    verts = []
-    if len(values) >= 4:
-        count, offset = get_long(values, 0)
-        while (count > 0):
-            floats, offset = get_floats(values, offset, 3)
-            verts.extend(floats)
-            count -= 1
-    return verts
+    if len(values) < 4:
+        return np.empty(0, dtype=np.float32)
+    count, offset = get_long(values, 0)
+    available = (len(values) - offset) // 12
+    return np.frombuffer(
+        values,
+        dtype="<f4",
+        count=min(count, available) * 3,
+        offset=offset,
+    )
 
 
 def get_mesh_polys(data):
     count, offset = get_long(data, 0)
-    polygons = []
-    mats = []
-    while count > 0:
-        poly, offset = get_longs(data, offset, 3)
-        edge, offset = get_long(data, offset)
-        (flag, mat), offset = get_shorts(data, offset, 2)
-        polygons.append(poly)
-        mats.append(mat)
-        count -= 1
-    return polygons, mats
+    dtype = np.dtype({
+        "names": ("vertices", "edge", "flag", "material"),
+        "formats": (("<u4", 3), "<u4", "<u2", "<u2"),
+        "offsets": (0, 12, 16, 18),
+        "itemsize": 20,
+    })
+    available = (len(data) - offset) // dtype.itemsize
+    records = np.frombuffer(data, dtype=dtype, count=min(count, available), offset=offset)
+    return records["vertices"], records["material"].astype(np.int32)
 
 
 def get_face_chunks(chunk):
@@ -1094,27 +1145,16 @@ def get_poly_loops(chunk):
 
 
 def get_uvw_coords(chunk):
-    offset = 0
-    uvindex = []
-    data = chunk.data
-    while (offset < len(data)):
-        idx, offset = get_long(data, offset)
-        uvindex.append(idx)
-    cnt = uvindex.pop(0)
-    facelist = list(zip(*[iter(uvindex)]*3))
-    uvindex.clear()
-    return facelist
+    data = np.frombuffer(chunk.data, dtype="<u4")
+    return data[1:1 + ((len(data) - 1) // 3) * 3].reshape(-1, 3)
 
 
 def get_tri_data(chunk):
-    vindex = []
     data = chunk.data
     head, offset = get_long(data)
-    while (offset < head):
-        idx, offset = get_long(data, offset)
-        vindex.append(idx)
-    triangles = list(zip(*[iter(vindex)]*3))
-    return triangles
+    count = max(0, min((head - offset) // 4, (len(data) - offset) // 4))
+    indices = np.frombuffer(data, dtype="<u4", count=count, offset=offset)
+    return indices[:(len(indices) // 3) * 3].reshape(-1, 3)
 
 
 def get_property(properties, idx):
@@ -1189,6 +1229,9 @@ def get_material_name(reference):
 def get_rgb(colors, idx):
     prop = get_property(colors, idx)
     if (prop is not None):
+        if not isinstance(prop.data, bytes) or len(prop.data) < 16:
+            print("\tMaterialWarning: RGB property 0x%X has no inline color" % idx)
+            return None
         siz = len(prop.data) - 16
         rgb, offset = get_floats(prop.data, siz, 3)
         return (rgb[0], rgb[1], rgb[2])
@@ -1198,6 +1241,9 @@ def get_rgb(colors, idx):
 def get_color(colors, idx):
     prop = get_property(colors, idx)
     if (prop is not None):
+        if not isinstance(prop.data, bytes) or len(prop.data) < 12:
+            print("\tMaterialWarning: color property 0x%X has no inline color" % idx)
+            return None
         siz = len(prop.data) - 12
         col, offset = get_floats(prop.data, siz, 3)
         return (col[0], col[1], col[2])
@@ -1207,6 +1253,9 @@ def get_color(colors, idx):
 def get_value(value, idx):
     prop = get_property(value, idx)
     if (prop is not None):
+        if not isinstance(prop.data, bytes) or len(prop.data) < 4:
+            print("\tMaterialWarning: value property 0x%X has no inline value" % idx)
+            return None
         siz = len(prop.data) - 4
         val, offset = get_float(prop.data, siz)
         return val
@@ -1215,9 +1264,13 @@ def get_value(value, idx):
 
 def get_parameter(values, fmt):
     if (fmt == 0x1):
+        if not isinstance(values.data, bytes) or len(values.data) < 12:
+            return None
         siz = len(values.data) - 12
         para, offset = get_floats(values.data, siz, 3)
     else:
+        if not isinstance(values.data, bytes) or len(values.data) < 4:
+            return None
         siz = len(values.data) - 4
         para, offset = get_float(values.data, siz)
     return para
@@ -1587,9 +1640,109 @@ def get_arch_material(ad):
     return material
 
 
-def adjust_material(filename, search, obj, mat):
+def get_multi_material_ids(parameter_block, count):
+    if parameter_block is None:
+        return list(range(count))
+
+    for chunk in parameter_block.children:
+        if chunk.types == 0x000A:
+            header_size = 11
+        elif chunk.types == 0x000E:
+            header_size = 15
+        else:
+            continue
+        if not isinstance(chunk.data, bytes) or len(chunk.data) < header_size + 4:
+            continue
+
+        _, parameter_type = struct.unpack_from("<HH", chunk.data)
+        if parameter_type != 0x0801:
+            continue
+        stored_count = struct.unpack_from("<I", chunk.data, header_size)[0]
+        if stored_count != count:
+            continue
+
+        offset = header_size + 4
+        material_ids = []
+        for _ in range(stored_count):
+            if offset + 5 > len(chunk.data):
+                material_ids = []
+                break
+            material_id = struct.unpack_from("<i", chunk.data, offset + 1)[0]
+            if material_id <= 0:
+                material_ids = []
+                break
+            material_ids.append(material_id - 1)
+            offset += 5
+        if material_ids:
+            return material_ids
+
+    return list(range(count))
+
+
+def remap_material_indices(indices, slot_map):
+    indices = np.asarray(indices, dtype=np.int32)
+    if not len(indices) or not slot_map:
+        return indices
+
+    fallback = slot_map.get(0, min(slot_map.values()))
+    remapped = np.full(indices.shape, fallback, dtype=np.int32)
+    missing = []
+    for material_id in np.unique(indices):
+        slot = slot_map.get(int(material_id))
+        if slot is None:
+            missing.append(int(material_id))
+        else:
+            remapped[indices == material_id] = slot
+    if missing:
+        print(
+            "\tMaterialWarning: no Multi/Sub material for face IDs %s"
+            % ", ".join(str(material_id + 1) for material_id in missing)
+        )
+    return remapped
+
+
+def adjust_multi_material(resolver, obj, mat):
+    references = get_references(mat)
+    parameter_block = references[0] if references and get_guid(references[0]) == 0x82 else None
+    count_chunk = mat.get_first(0x4002)
+    if (
+        count_chunk is None
+        or not isinstance(count_chunk.data, bytes)
+        or len(count_chunk.data) < 4
+    ):
+        count = len(references) - (1 if parameter_block is not None else 0)
+    else:
+        count = struct.unpack_from("<I", count_chunk.data)[0]
+
+    submaterials = references[1:] if parameter_block is not None else references
+    material_ids = get_multi_material_ids(parameter_block, count)
+    slot_map = {}
+    for index in range(count):
+        material_id = material_ids[index]
+        submaterial = submaterials[index] if index < len(submaterials) else None
+        before = len(obj.data.materials)
+        nested_map = (
+            adjust_material(resolver, obj, submaterial)
+            if submaterial is not None
+            else None
+        )
+        if len(obj.data.materials) == before:
+            placeholder_name = "BlenderMax Missing Material %d" % (material_id + 1)
+            placeholder = bpy.data.materials.get(placeholder_name)
+            if placeholder is None:
+                placeholder = bpy.data.materials.new(placeholder_name)
+            obj.data.materials.append(placeholder)
+        slot = (
+            nested_map.get(material_id, before)
+            if isinstance(nested_map, dict)
+            else before
+        )
+        slot_map.setdefault(material_id, slot)
+    return slot_map
+
+
+def adjust_material(resolver, obj, mat):
     material = mtl_id = mtl_name = None
-    dirname = os.path.dirname(filename)
     if (mat is not None):
         uid = get_guid(mat)
         if (uid == 0x0002):  # Standard
@@ -1636,24 +1789,18 @@ def adjust_material(filename, search, obj, mat):
             layers = get_reference(refs[0])
             mtl_id = mat.get_first(0x0FA0)
             for layer in layers.values():
-                material = adjust_material(filename, search, obj, layer)
+                material = adjust_material(resolver, obj, layer)
         elif (uid in {SHEL_MTL, VTWO_MTL}):  # VRay2SidedMtl
             sides = get_references(mat)
             for side in sides:
-                material = adjust_material(filename, search, obj, side)
+                material = adjust_material(resolver, obj, side)
         elif (uid == ARCH_MTL):  # Arch
             mtl_name = get_material_name(mat)
             refs = get_references(mat)
             material = get_arch_material(refs[0])
         elif (uid == 0x0200):  # Multi/Sub-Object
-            refs = get_references(mat)
-            if not refs:
-                rf = get_reference(mat)
-                refs = list(rf.values())
-            for ref in refs:
-                if (ref is not None):
-                    material = adjust_material(filename, search, obj, ref)
-        if (obj is not None) and (material is not None):
+            return adjust_multi_material(resolver, obj, mat)
+        if (obj is not None) and isinstance(material, Material):
             if mtl_name is None:
                 matname = mtl_id.children[0].data if mtl_id else get_cls_name(mat)
             else:
@@ -1682,34 +1829,37 @@ def adjust_material(filename, search, obj, mat):
             transmap = material.get('transmap', None)
             normalmap = material.get('normalmap', None)
             if (texname is not None):
-                image = load_image(str(texname), dirname, place_holder=False, recursive=search, check_existing=True)
+                image = resolver.load(str(texname))
                 if (image is not None):
                     if image.depth in {32, 16}:
                         image.alpha_mode = 'CHANNEL_PACKED'
                     shader.base_color_texture.image = image
             if (shinmap is not None):
-                image = load_image(str(shinmap), dirname, place_holder=False, recursive=search, check_existing=True)
+                image = resolver.load(str(shinmap), data=True)
                 if (image is not None):
                     shader.roughness_texture.image = image
             if (glossmap is not None):
-                image = load_image(str(glossmap), dirname, place_holder=False, recursive=search, check_existing=True)
+                image = resolver.load(str(glossmap), data=True)
                 if (image is not None):
                     shader.specular_tint_texture.image = image
             if (normalmap is not None):
                 shader.normalmap_strength = material.get('strength', 0.8)
-                image = load_image(str(normalmap), dirname, place_holder=False, recursive=search, check_existing=True)
+                image = resolver.load(str(normalmap), data=True)
                 if (image is not None):
                     shader.normalmap_texture.image = image
             if (transmap is not None):
                 if (transmap == texname and shader.node_principled_bsdf.inputs[0].is_linked):
                     imgwrap = shader.base_color_texture.node_image
-                    shader.material.node_tree.links.new(imgwrap.outputs[1], shader.node_principled_bsdf.inputs[4])
+                    shader.material.node_tree.links.new(
+                        imgwrap.outputs["Alpha"],
+                        shader.node_principled_bsdf.inputs["Alpha"],
+                    )
                 else:
-                    image = load_image(str(transmap), dirname, place_holder=False, recursive=search, check_existing=True)
+                    image = resolver.load(str(transmap), data=True)
                     if (image is not None):
                         shader.alpha_texture.image = image
-            if (transmap or shader.node_principled_bsdf.inputs[4].default_value < 1.0):
-                shader.material.blend_method = 'HASHED'
+            if (transmap or shader.node_principled_bsdf.inputs["Alpha"].default_value < 1.0):
+                shader.material.surface_render_method = 'DITHERED'
 
 
 def get_bezier_floats(pos):
@@ -1748,7 +1898,7 @@ def get_rotation(pos):
             rotation = mathutils.Euler((rot[0], rot[1], rot[2])).to_quaternion()
         elif (uid == 0x442313):  # TCB Rotation
             rot = pos.get_first(0x2504).data
-            rotation = mathutils.Quaternion((rot[3], rot[2], rot[1], rot[0]))
+            rotation = max_quaternion(rot)
         elif (uid == MATRIX_ROT):  # Rotation Wire
             return get_rotation(get_references(pos)[0])
         elif (uid == 0x4B4B1003):  # Rotation List
@@ -1774,7 +1924,7 @@ def get_scale(pos):
             if (scl is None):
                 scl = pos.get_first(0x2505)
             pos = scl.data
-        elif (uid == 0x4B4B1002):  # Scale List
+        elif (uid == 0x4B4B1004):  # Scale List
             refs = get_references(pos)
             if (len(refs) >= 3):
                 return get_scale(refs[0])
@@ -1784,22 +1934,52 @@ def get_scale(pos):
     return scale
 
 
+def get_scale_matrix(pos):
+    values = (1.0, 1.0, 1.0)
+    if pos:
+        uid = get_guid(pos)
+        if uid == MATRIX_SCL:
+            values = get_bezier_floats(pos)
+        elif uid in {0x2010, 0x442315, 0x2004}:
+            chunk = pos.get_first(0x2505) or pos.get_first(0x2501)
+            if chunk is not None:
+                values = chunk.data
+        elif uid == 0x4B4B1004:
+            refs = get_references(pos)
+            if refs:
+                return get_scale_matrix(refs[0])
+    return max_scale_matrix(values)
+
+
 def create_matrix(prc):
     uid = get_guid(prc)
     mtx = mathutils.Matrix.Identity(4)
     if (uid == 0x2005):  # Position/Rotation/Scale
         pos = get_position(get_references(prc)[0])
         rot = get_rotation(get_references(prc)[1])
-        scl = get_scale(get_references(prc)[2])
-        mtx = mathutils.Matrix.LocRotScale(pos, rot, scl)
+        scl = get_scale_matrix(get_references(prc)[2])
+        mtx = (
+            mathutils.Matrix.Translation(pos)
+            @ rot.to_matrix().to_4x4()
+            @ scl
+        )
     elif (uid == 0x9154):  # BipSlave Control
         biped = get_references(prc)[-1]
         if biped and (get_guid(biped) == BIPED_ANIM):
             ref = get_references(biped)
-            scl = get_scale(get_references(ref[1])[0])
+            scl = get_scale_matrix(get_references(ref[1])[0])
             rot = get_rotation(get_references(ref[2])[0])
             pos = get_position(get_references(ref[3])[0])
-            mtx = mathutils.Matrix.LocRotScale(pos, rot, scl)
+            mtx = (
+                mathutils.Matrix.Translation(pos)
+                @ rot.to_matrix().to_4x4()
+                @ scl
+            )
+    elif (uid == 0x2006):  # Look At
+        refs = get_references(prc)
+        pos = get_position(refs[1]) if len(refs) > 1 else mathutils.Vector()
+        scl = get_scale_matrix(refs[3]) if len(refs) > 3 else mathutils.Matrix.Identity(4)
+        mtx = mathutils.Matrix.Translation(pos) @ scl
     return mtx
 
 
@@ -1826,24 +2006,26 @@ def adjust_matrix(obj, node):
 
 
 def draw_shape(name, mesh, faces):
-    data = []
-    loopstart = []
-    looplines = loop = 0
-    nb_faces = len(faces)
-    for fid in range(nb_faces):
-        polyface = faces[fid]
-        looplines += len(polyface)
+    vertices = np.asarray(mesh.verts, dtype=np.float32).reshape(-1, 3)
+    counts = np.fromiter((len(face) for face in faces), dtype=np.int32, count=len(faces))
+    looplines = int(counts.sum())
+    loopstart = np.empty(len(faces), dtype=np.int32)
+    if len(loopstart):
+        loopstart[0] = 0
+        np.cumsum(counts[:-1], out=loopstart[1:])
+    indices = (
+        np.concatenate([np.asarray(face, dtype=np.int32) for face in faces])
+        if looplines
+        else np.empty(0, dtype=np.int32)
+    )
     shape = bpy.data.meshes.new(name)
-    shape.vertices.add(len(mesh.verts) // 3)
+    shape.vertices.add(len(vertices))
     shape.loops.add(looplines)
-    shape.polygons.add(nb_faces)
-    shape.vertices.foreach_set("co", mesh.verts)
-    for vtx in faces:
-        loopstart.append(loop)
-        data.extend(vtx)
-        loop += len(vtx)
+    shape.polygons.add(len(faces))
+    shape.attributes["position"].data.foreach_set("vector", vertices.ravel())
     shape.polygons.foreach_set("loop_start", loopstart)
-    shape.loops.foreach_set("vertex_index", data)
+    shape.polygons.foreach_set("loop_total", counts)
+    shape.loops.foreach_set("vertex_index", indices)
     return shape
 
 
@@ -1852,10 +2034,12 @@ def draw_map(shape, uvmap, uvcoords, uvwids):
     if (uvlayer):
         if (uvmap > 0):
             uvlayer.name = 'UVMap_%d' % uvmap
-        coords = [co for i, co in enumerate(uvcoords) if i % 3 in (0, 1)]
-        uvcord = list(zip(coords[0::2], coords[1::2]))
-        uvloops = tuple(uv for uvws in uvwids for uvid in uvws for uv in uvcord[uvid])
+        uvcord = np.asarray(uvcoords, dtype=np.float32).reshape(-1, 3)[:, :2]
         try:
+            uvindices = np.concatenate(
+                [np.asarray(face, dtype=np.int32) for face in uvwids]
+            )
+            uvloops = uvcord[uvindices].reshape(-1)
             shape.uv_layers.active.data.foreach_set("uv", uvloops)
         except Exception as exc:
             print('\tArrayLengthMismatchError: %s' % exc)
@@ -1864,7 +2048,7 @@ def draw_map(shape, uvmap, uvcoords, uvwids):
 
 def create_shape(context, settings, node, mesh, mat):
     meshname = ""
-    filename, obtypes, search = settings
+    filename, obtypes, search, resolver = settings
     name = node.get_first(0x0962)
     if name is not None:
         meshname = name.data
@@ -1877,10 +2061,15 @@ def create_shape(context, settings, node, mesh, mat):
     obj = bpy.data.objects.new(meshname, meshobject)
     context.view_layer.active_layer_collection.collection.objects.link(obj)
     if ('MATERIAL' in obtypes):
-        adjust_material(filename, search, obj, mat)
+        material_slot_map = adjust_material(resolver, obj, mat)
         if (len(mesh.mats) > 0):
             try:
-                obj.data.polygons.foreach_set("material_index", mesh.mats)
+                material_indices = (
+                    remap_material_indices(mesh.mats, material_slot_map)
+                    if isinstance(material_slot_map, dict)
+                    else mesh.mats
+                )
+                obj.data.polygons.foreach_set("material_index", material_indices)
             except Exception as exc:
                 print('\tArrayLengthMismatchError: %s' % exc)
     object_list.append(obj)
@@ -1892,6 +2081,22 @@ def create_dummy_object(context, node, uid):
     dummy.empty_display_type = 'SINGLE_ARROW' if uid == BIPED_OBJ else 'PLAIN_AXES'
     context.view_layer.active_layer_collection.collection.objects.link(dummy)
     return dummy
+
+
+def create_camera_object(context, node):
+    name = get_node_name(node)
+    camera = bpy.data.cameras.new(name)
+    obj = bpy.data.objects.new(name, camera)
+    context.view_layer.active_layer_collection.collection.objects.link(obj)
+    return obj
+
+
+def create_light_object(context, node, light_type):
+    name = get_node_name(node)
+    light = bpy.data.lights.new(name, light_type)
+    obj = bpy.data.objects.new(name, light)
+    context.view_layer.active_layer_collection.collection.objects.link(obj)
+    return obj
 
 
 def create_editable_poly(context, settings, node, msh, mat):
@@ -1927,7 +2132,7 @@ def create_editable_poly(context, settings, node, msh, mat):
             created += create_shape(context, settings, node, mesh, mat)
         elif (mesh.faces is not None):
             created += create_shape(context, settings, node, mesh, mat)
-        elif (mesh.tris is not None) and 'UV' not in obtypes:
+        elif (mesh.tris is not None) and 'UV' not in settings[1]:
             created += create_shape(context, settings, node, mesh, mat)
     return created
 
@@ -1967,7 +2172,7 @@ def create_shell(context, settings, node, shell, mat, mtx):
 def create_plane(context, settings, node, plane, mat, mtx):
     created = []
     name = node.get_first(0x0962)
-    filename, obtypes, search = settings
+    filename, obtypes, search, resolver = settings
     parablock = get_references(plane)[0]
     if len(parablock.children[1].data) > 11:
         values = parablock.children
@@ -1985,7 +2190,7 @@ def create_plane(context, settings, node, plane, mat, mtx):
     if name is not None:
         obj.name = name.data
     if ('MATERIAL' in obtypes):
-        adjust_material(filename, search, obj, mat)
+        adjust_material(resolver, obj, mat)
     adjust_matrix(obj, mtx)
     created.append(obj)
     return created
@@ -1994,7 +2199,7 @@ def create_plane(context, settings, node, plane, mat, mtx):
 def create_box(context, settings, node, box, mat, mtx):
     created = []
     name = node.get_first(0x0962)
-    filename, obtypes, search = settings
+    filename, obtypes, search, resolver = settings
     parablock = get_references(box)
     if parablock:
         values = parablock[0].children
@@ -2017,7 +2222,7 @@ def create_box(context, settings, node, box, mat, mtx):
         if name is not None:
             obj.name = name.data
         if ('MATERIAL' in obtypes):
-            adjust_material(filename, search, obj, mat)
+            adjust_material(resolver, obj, mat)
     else:
         obj = bpy.data.objects.new(name.data, None)
         context.view_layer.active_layer_collection.collection.objects.link(obj)
@@ -2030,7 +2235,7 @@ def create_box(context, settings, node, box, mat, mtx):
 def create_sphere(context, settings, node, sphere, mat, mtx):
     created = []
     name = node.get_first(0x0962)
-    filename, obtypes, search = settings
+    filename, obtypes, search, resolver = settings
     parablock = get_references(sphere)[0]
     if len(parablock.children[1].data) > 11:
         values = parablock.children[1]
@@ -2048,7 +2253,7 @@ def create_sphere(context, settings, node, sphere, mat, mtx):
     if name is not None:
         obj.name = name.data
     if ('MATERIAL' in obtypes):
-        adjust_material(filename, search, obj, mat)
+        adjust_material(resolver, obj, mat)
     adjust_matrix(obj, mtx)
     created.append(obj)
     return created
@@ -2057,7 +2262,7 @@ def create_sphere(context, settings, node, sphere, mat, mtx):
 def create_torus(context, settings, node, torus, mat, mtx):
     created = []
     name = node.get_first(0x0962)
-    filename, obtypes, search = settings
+    filename, obtypes, search, resolver = settings
     parablock = get_references(torus)[0]
     if len(parablock.children[1].data) > 11:
         values = parablock.children
@@ -2075,7 +2280,7 @@ def create_torus(context, settings, node, torus, mat, mtx):
     if name is not None:
         obj.name = name.data
     if ('MATERIAL' in obtypes):
-        adjust_material(filename, search, obj, mat)
+        adjust_material(resolver, obj, mat)
     adjust_matrix(obj, mtx)
     created.append(obj)
     return created
@@ -2084,7 +2289,7 @@ def create_torus(context, settings, node, torus, mat, mtx):
 def create_cylinder(context, settings, node, cylinder, mat, mtx):
     created = []
     name = node.get_first(0x0962)
-    filename, obtypes, search = settings
+    filename, obtypes, search, resolver = settings
     parablock = get_references(cylinder)
     if parablock:
         values = parablock[0].children
@@ -2105,7 +2310,7 @@ def create_cylinder(context, settings, node, cylinder, mat, mtx):
         if name is not None:
             obj.name = name.data
         if ('MATERIAL' in obtypes):
-            adjust_material(filename, search, obj, mat)
+            adjust_material(resolver, obj, mat)
     else:
         obj = bpy.data.objects.new(name.data, None)
         context.view_layer.active_layer_collection.collection.objects.link(obj)
@@ -2117,7 +2322,7 @@ def create_cylinder(context, settings, node, cylinder, mat, mtx):
 def create_cone(context, settings, node, cone, mat, mtx):
     created = []
     name = node.get_first(0x0962)
-    filename, obtypes, search = settings
+    filename, obtypes, search, resolver = settings
     parablock = get_references(cone)[0]
     if len(parablock.children[1].data) > 11:
         values = parablock.children
@@ -2139,7 +2344,7 @@ def create_cone(context, settings, node, cone, mat, mtx):
     if name is not None:
         obj.name = name.data
     if ('MATERIAL' in obtypes):
-        adjust_material(filename, search, obj, mat)
+        adjust_material(resolver, obj, mat)
     adjust_matrix(obj, mtx)
     created.append(obj)
     return created
@@ -2180,6 +2385,14 @@ def create_mesh(context, settings, node, msh, mat, mtx):
             created = [create_dummy_object(context, node, uid)]
         elif (uid == BIPED_OBJ and 'ARMATURE' in settings[1]):
             created = [create_dummy_object(context, node, uid)]
+        elif (uid == CAMERA and 'CAMERA' in settings[1]):
+            created = [create_camera_object(context, node)]
+        elif (uid == CAMERA_TARGET and 'CAMERA' in settings[1]):
+            created = [create_dummy_object(context, node, uid)]
+        elif (uid == OMNI_LIGHT and 'LIGHT' in settings[1]):
+            created = [create_light_object(context, node, 'POINT')]
+        elif (uid == DIRECT_LIGHT and 'LIGHT' in settings[1]):
+            created = [create_light_object(context, node, 'SUN')]
         elif (uid == BOOLEAN):
             boolrefs = get_references(get_references(msh)[0])
             for ref in boolrefs:
@@ -2207,21 +2420,111 @@ def create_object(context, settings, node, transform):
             nodesize = node.get_first(0x96C)
             quats = noderota.data if noderota else (0.0, 0.0, 0.0, 1.0)
             pivot = mathutils.Vector(nodeloca.data if nodeloca else (0.0, 0.0, 0.0))
-            angle = mathutils.Quaternion((quats[3], quats[2], quats[1], quats[0]))
-            scale = mathutils.Vector(nodesize.data[:3] if nodesize else (1.0, 1.0, 1.0))
-            p_mtx = mathutils.Matrix.LocRotScale(pivot, angle, scale)
+            angle = max_quaternion(quats)
+            scale = max_scale_matrix(
+                nodesize.data if nodesize else (1.0, 1.0, 1.0)
+            )
+            p_mtx = (
+                mathutils.Matrix.Translation(pivot)
+                @ angle.to_matrix().to_4x4()
+                @ scale
+            )
             obj.data.transform(p_mtx)
     matrix_dict[nodename] = create_matrix(prs)
     parent_dict[nodename] = parentname
+    if get_guid(prs) == 0x2006:
+        refs = get_references(prs)
+        if refs and refs[0] is not None:
+            target_dict[nodename] = get_node_name(refs[0])
     return nodename, created
 
 
-def make_scene(context, settings, mscale, transform, parent):
+def import_animations(context, settings, imported_nodes, animation_options):
+    if not animation_options["enabled"]:
+        return None
+
+    action_builder = ActionBuilder("%s|MAX" % Path(settings[0]).stem)
+    unsupported = set()
+    for node, nodename, objects in imported_nodes:
+        prs = get_matrix_mesh_material(node)[0]
+        uid = get_guid(prs)
+        if uid in {0x9154, 0x9156, 0x3011}:
+            unsupported.add(get_cls_name(prs))
+            continue
+        try:
+            tracks = extract_transform_tracks(prs, get_guid, get_references)
+        except ValueError as exc:
+            print("\tAnimationError: %s '%s'" % (exc, nodename))
+            continue
+        if not tracks.animated:
+            continue
+
+        source_anchor = create_matrix(prs)
+        for obj in objects:
+            samples = sample_transform(
+                tracks,
+                obj.matrix_basis.copy(),
+                source_anchor,
+                animation_options["fps"],
+                animation_options["frame_offset"],
+                animation_options["sampling"],
+            )
+            if samples is not None:
+                action_builder.add_object(obj, samples)
+
+    action = action_builder.finish()
+    scene = context.scene
+    fps = animation_options["fps"]
+    scene.render.fps = round(fps)
+    scene.render.fps_base = scene.render.fps / fps
+    if action is not None:
+        action["source_file"] = settings[0]
+        action["source_fps"] = fps
+        print(
+            "\tAnimation: %d objects, frames %g-%g"
+            % (
+                action_builder.animated_objects,
+                action_builder.frame_start,
+                action_builder.frame_end,
+            )
+        )
+
+    ticks_per_frame = TICKS_PER_SECOND / fps
+    start_tick = animation_options.get("start_tick")
+    end_tick = animation_options.get("end_tick")
+    if start_tick is not None and end_tick is not None:
+        scene.frame_start = math.floor(
+            start_tick / ticks_per_frame + animation_options["frame_offset"]
+        )
+        scene.frame_end = math.ceil(
+            end_tick / ticks_per_frame + animation_options["frame_offset"]
+        )
+    elif action is not None:
+        scene.frame_start = math.floor(action_builder.frame_start)
+        scene.frame_end = math.ceil(action_builder.frame_end)
+    if action is not None or (start_tick is not None and end_tick is not None):
+        scene.frame_set(scene.frame_start)
+    if unsupported:
+        print(
+            "\tAnimationWarning: unsupported controllers: %s"
+            % ", ".join(sorted(unsupported))
+        )
+    return action
+
+
+def make_scene(context, settings, mscale, transform, parent, animation_options):
     imported = []
+    imported_nodes = []
     for chunk in parent.children:
-        if isinstance(chunk, SceneChunk) and (get_guid(chunk) == 0x1 and get_super_id(chunk) == 0x1) or get_node_parent(chunk):
+        if (
+            isinstance(chunk, SceneChunk)
+            and get_guid(chunk) == 0x1
+            and get_super_id(chunk) == 0x1
+        ) or get_node_parent(chunk):
             try:
-                imported.append(create_object(context, settings, chunk, transform))
+                nodename, created = create_object(context, settings, chunk, transform)
+                imported.append((nodename, created))
+                imported_nodes.append((chunk, nodename, created))
             except Exception as exc:
                 print("\tImportError: %s %s" % (exc, chunk), get_node_name(chunk))
 
@@ -2247,65 +2550,129 @@ def make_scene(context, settings, mscale, transform, parent):
                     obj.matrix_world = trans_mtx
                 obj.matrix_world = mscale @ obj.matrix_world
 
+    for source_name, target_name in target_dict.items():
+        sources = objects.get(source_name, ())
+        targets = objects.get(target_name, ())
+        if not targets:
+            continue
+        for obj in sources:
+            if obj.type not in {'CAMERA', 'LIGHT'}:
+                continue
+            constraint = obj.constraints.new('TRACK_TO')
+            constraint.name = "MAX Look At"
+            constraint.target = targets[0]
+            constraint.track_axis = 'TRACK_NEGATIVE_Z'
+            constraint.up_axis = 'UP_Y'
+    import_animations(context, settings, imported_nodes, animation_options)
 
-def read_scene(context, maxfile, settings, mscale, transform):
+
+def read_scene(context, maxfile, settings, mscale, transform, animation_options):
     global SCENE_LIST, META_DATA
     metasid = min(max(entry.sid for entry in maxfile.direntries if entry is not None), 11)
     SCENE_LIST = read_chunks(maxfile, 'Scene', SceneChunk)
     META_DATA = read_chunks(maxfile, maxfile.direntries[metasid].name, superId=metasid) if metasid >= 0xA else []
-    make_scene(context, settings, mscale, transform, SCENE_LIST[0])
+    make_scene(context, settings, mscale, transform, SCENE_LIST[0], animation_options)
     # For debug: Print directory
     # print('Directory', maxfile.direntries[0].kids_dict.keys())
 
 
-def read(context, filename, mscale, obtypes, search, transform):
-    if (is_maxfile(filename)):
-        settings = filename, obtypes, search
-        maxfile = ImportMaxFile(filename)
+def read(context, filename, mscale, obtypes, search, transform, texture_directory, animation_options):
+    if not is_maxfile(filename):
+        raise ValueError("File is not an Autodesk 3ds Max OLE scene: %s" % filename)
+
+    resolver = TextureResolver(filename, texture_directory, search)
+    settings = filename, obtypes, search, resolver
+    with ImportMaxFile(filename) as maxfile:
         read_class_data(maxfile, filename)
         read_config(maxfile, filename)
+        file_animation_options = animation_options.copy()
+        timing = get_scene_timing()
+        if file_animation_options["use_scene_fps"] and timing["fps"] is not None:
+            file_animation_options["fps"] = float(timing["fps"])
+        file_animation_options["start_tick"] = timing["start_tick"]
+        file_animation_options["end_tick"] = timing["end_tick"]
         read_directory(maxfile, filename)
         read_class_directory(maxfile, filename)
         read_video_postqueue(maxfile, filename)
-        read_scene(context, maxfile, settings, mscale, transform)
-    else:
-        print("File seems to be no 3D Studio Max file!")
+        read_scene(
+            context,
+            maxfile,
+            settings,
+            mscale,
+            transform,
+            file_animation_options,
+        )
 
 
-def load(operator, context, files=[], directory="", filepath="", scale_objects=1.0, use_collection=False,
-         use_image_search=True, object_filter=None, use_apply_matrix=True, global_matrix=None):
+def load(operator, context, files=None, directory="", filepath="", scale_objects=1.0, use_collection=False,
+         use_image_search=True, texture_directory="", object_filter=None, use_apply_matrix=True,
+         use_animation=True, use_scene_fps=True, animation_fps=30.0,
+         animation_sampling='BAKE', frame_offset=0.0, global_matrix=None):
 
     parent_dict.clear()
     matrix_dict.clear()
+    target_dict.clear()
 
-    context.window.cursor_set('WAIT')
+    if context.window:
+        context.window.cursor_set('WAIT')
     mscale = mathutils.Matrix.Scale(scale_objects, 4)
     if global_matrix is not None:
         mscale = global_matrix @ mscale
 
     if not object_filter:
-        object_filter = {'MATERIAL', 'UV', 'PRIMITIVE', 'EMPTY'}
+        object_filter = {
+            'MATERIAL',
+            'UV',
+            'PRIMITIVE',
+            'EMPTY',
+            'ARMATURE',
+            'CAMERA',
+            'LIGHT',
+        }
 
     default_layer = context.view_layer.active_layer_collection.collection
+    animation_options = {
+        "enabled": use_animation,
+        "use_scene_fps": use_scene_fps,
+        "fps": animation_fps,
+        "sampling": animation_sampling,
+        "frame_offset": frame_offset,
+    }
 
-    if not len(files):
+    if not files:
         files = [Path(filepath)]
         directory = Path(filepath).parent
 
-    for fl in files:
-        if use_collection:
-            collection = bpy.data.collections.new(Path(fl.name).stem)
-            context.scene.collection.children.link(collection)
-            context.view_layer.active_layer_collection = context.view_layer.layer_collection.children[collection.name]
-        read(context, os.path.join(directory, fl.name), mscale, obtypes=object_filter, search=use_image_search, transform=use_apply_matrix)
-
-    parent_dict.clear()
-    matrix_dict.clear()
-
-    active = context.view_layer.layer_collection.children.get(default_layer.name)
-    if active is not None:
-        context.view_layer.active_layer_collection = active
-
-    context.window.cursor_set('DEFAULT')
-
-    return {'FINISHED'}
+    try:
+        for fl in files:
+            if use_collection:
+                collection = bpy.data.collections.new(Path(fl.name).stem)
+                context.scene.collection.children.link(collection)
+                context.view_layer.active_layer_collection = (
+                    context.view_layer.layer_collection.children[collection.name]
+                )
+            read(
+                context,
+                os.path.join(directory, fl.name),
+                mscale,
+                obtypes=object_filter,
+                search=use_image_search,
+                transform=use_apply_matrix,
+                texture_directory=texture_directory,
+                animation_options=animation_options,
+            )
+        return {'FINISHED'}
+    except Exception as exc:
+        traceback.print_exc()
+        operator.report({'ERROR'}, "MAX import failed: %s" % exc)
+        return {'CANCELLED'}
+    finally:
+        parent_dict.clear()
+        matrix_dict.clear()
+        target_dict.clear()
+        clear_texture_cache()
+        active = context.view_layer.layer_collection.children.get(default_layer.name)
+        if active is not None:
+            context.view_layer.active_layer_collection = active
+        if context.window:
+            context.window.cursor_set('DEFAULT')

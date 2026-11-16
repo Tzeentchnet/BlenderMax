@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 
-__author__ = "Sebastian Sille <nrgsille@gmail.com>"
-__version__ = "1.9.2"
-__date__ = "18 Nov 2023"
+__author__ = "BlenderMax contributors; Sebastian Sille; Jens M. Plonka; Philippe Lagadec"
+__version__ = "2.0.0"
+__date__ = "16 Nov 2026"
 
 
 import bpy
@@ -30,10 +30,11 @@ if "bpy" in locals():
 
 
 @orientation_helper(axis_forward='Y', axis_up='Z')
-class ImportMax(bpy.types.Operator, ImportHelper):
+class ImportBlenderMax(bpy.types.Operator, ImportHelper):
     """Import Autodesk MAX"""
-    bl_idname = "import_scene.max"
-    bl_label = "Import MAX (.max)"
+    bl_idname = "import_scene.blender_max"
+    bl_label = "Import BlenderMax (.max)"
+    bl_description = "Import Autodesk 3ds Max scenes, materials, UVs, hierarchy, and transform animation"
     bl_options = {'PRESET', 'UNDO'}
 
     filename_ext = ".max"
@@ -54,6 +55,12 @@ class ImportMax(bpy.types.Operator, ImportHelper):
         "(Warning, may be slow)",
         default=True,
     )
+    texture_directory: StringProperty(
+        name="Texture Directory",
+        description="Optional root directory for resolving external material textures",
+        subtype='DIR_PATH',
+        default="",
+    )
     object_filter: EnumProperty(
         name="Object Filter", options={'ENUM_FLAG'},
         items=(('MATERIAL', "Material".rjust(12), "", 'MATERIAL_DATA', 0x1),
@@ -61,9 +68,11 @@ class ImportMax(bpy.types.Operator, ImportHelper):
                ('PRIMITIVE', "Primitive".rjust(13), "", 'CUBE', 0x4),
                ('EMPTY', "Empty".rjust(11), "", 'EMPTY_AXIS', 0x8),
                ('ARMATURE', "Armature".rjust(11), "", 'ARMATURE_DATA', 0x10),
+               ('CAMERA', "Camera".rjust(11), "", 'CAMERA_DATA', 0x20),
+               ('LIGHT', "Light".rjust(10), "", 'LIGHT_DATA', 0x40),
                ),
         description="Object types to import",
-        default={'MATERIAL', 'UV', 'PRIMITIVE', 'EMPTY', 'ARMATURE'},
+        default={'MATERIAL', 'UV', 'PRIMITIVE', 'EMPTY', 'ARMATURE', 'CAMERA', 'LIGHT'},
     )
     use_collection: BoolProperty(
         name="Collection",
@@ -75,6 +84,37 @@ class ImportMax(bpy.types.Operator, ImportHelper):
         description="Use matrix to transform the objects",
         default=True,
     )
+    use_animation: BoolProperty(
+        name="Transform Animation",
+        description="Import supported Position/Rotation/Scale controller keyframes",
+        default=True,
+    )
+    use_scene_fps: BoolProperty(
+        name="Use Scene FPS",
+        description="Read frame rate and active frame range from the MAX Config stream",
+        default=True,
+    )
+    animation_sampling: EnumProperty(
+        name="Sampling",
+        description="Choose whether to preserve source key times or bake every frame",
+        items=(
+            ('BAKE', "Bake Every Frame", "Sample transforms every source frame for reliable quaternion playback"),
+            ('KEYS', "Source Keys", "Import only source key times for smaller actions"),
+        ),
+        default='BAKE',
+    )
+    animation_fps: FloatProperty(
+        name="Source FPS",
+        description="Source scene frame rate used to convert 3ds Max ticks to Blender frames",
+        min=1.0,
+        max=240.0,
+        default=30.0,
+    )
+    frame_offset: FloatProperty(
+        name="Frame Offset",
+        description="Offset added to imported animation frames",
+        default=0.0,
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -83,6 +123,7 @@ class ImportMax(bpy.types.Operator, ImportHelper):
 
         import_include(layout, self)
         import_transform(layout, self)
+        import_animation(layout, self)
 
     def execute(self, context):
         from . import import_max
@@ -93,7 +134,7 @@ class ImportMax(bpy.types.Operator, ImportHelper):
         return import_max.load(self, context, **keywords)
 
     def invoke(self, context, event):
-        return self.invoke_popup(context)
+        return ImportHelper.invoke(self, context, event)
 
 
 def import_include(layout, operator):
@@ -103,6 +144,7 @@ def import_include(layout, operator):
         layrow = layout.row(align=True)
         layrow.prop(operator, "use_image_search")
         layrow.label(text="", icon='OUTLINER_OB_IMAGE' if operator.use_image_search else 'IMAGE_DATA')
+        layout.prop(operator, "texture_directory")
         layout.column().prop(operator, "object_filter")
         layrow = layout.row(align=True)
         layrow.prop(operator, "use_collection")
@@ -121,10 +163,25 @@ def import_transform(layout, operator):
         layout.prop(operator, "axis_up")
 
 
+def import_animation(layout, operator):
+    header, body = layout.panel("MAX_import_animation", default_closed=False)
+    header.label(text="Animation")
+    if body:
+        body.prop(operator, "use_animation")
+        column = body.column()
+        column.enabled = operator.use_animation
+        column.prop(operator, "animation_sampling")
+        column.prop(operator, "use_scene_fps")
+        fps_row = column.row()
+        fps_row.enabled = not operator.use_scene_fps
+        fps_row.prop(operator, "animation_fps")
+        column.prop(operator, "frame_offset")
+
+
 class IO_FH_max(bpy.types.FileHandler):
-    bl_idname = "IO_FH_max"
-    bl_label = "3DS MAX"
-    bl_import_operator = "import_scene.max"
+    bl_idname = "IO_FH_blender_max"
+    bl_label = "BlenderMax"
+    bl_import_operator = "import_scene.blender_max"
     bl_export_operator = "export_scene.max"
     bl_file_extensions = ".max"
 
@@ -134,11 +191,11 @@ class IO_FH_max(bpy.types.FileHandler):
 
 
 def menu_func(self, context):
-    self.layout.operator(ImportMax.bl_idname, text="Autodesk MAX (.max)")
+    self.layout.operator(ImportBlenderMax.bl_idname, text="BlenderMax / Autodesk MAX (.max)")
 
 
 def register():
-    bpy.utils.register_class(ImportMax)
+    bpy.utils.register_class(ImportBlenderMax)
     bpy.utils.register_class(IO_FH_max)
     bpy.types.TOPBAR_MT_file_import.append(menu_func)
 
@@ -146,7 +203,7 @@ def register():
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func)
     bpy.utils.unregister_class(IO_FH_max)
-    bpy.utils.unregister_class(ImportMax)
+    bpy.utils.unregister_class(ImportBlenderMax)
 
 
 if __name__ == "__main__":

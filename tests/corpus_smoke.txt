@@ -1,0 +1,12 @@
+# Static mesh and primitive baseline
+models\Weapons\Flare\flare_reference.max
+models\props_rooftop\Scaffolding01a_physbox.max
+
+# Material and texture resolution
+models\props_borealis\door_throwswitch001a_idle.max
+
+# Standard PRS animation controllers
+models\Antlion_grub\antliongrub_walk.max
+
+# Biped controller coverage and explicit unsupported-controller reporting
+models\Generic Male Motion Capture\Start.max
