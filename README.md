@@ -4,51 +4,91 @@ BlenderMax is a native Autodesk 3ds Max (`.max`) importer for Blender 5.2 LTS.
 It is a modernized fork of
 [nrgsille76/io_scene_max](https://github.com/nrgsille76/io_scene_max), with
 NumPy-accelerated geometry decoding, Blender 5.2 layered actions, improved
-texture discovery, and a repeatable headless corpus runner.
+texture discovery, and researcher-facing format documentation.
 
-## Highlights
+## Features
 
-- Blender 5.2 extension package and file-handler integration.
-- Native OLE/MAX parsing without requiring an Autodesk 3ds Max installation,
-  including legacy `ClassDirectory`, `ClassDirectory2`, and `ClassDirectory3`
-  streams.
-- NumPy decoding for vertex, face, triangle, and UV buffers.
-- Blender bulk-data APIs for mesh positions, loops, polygons, UVs, material
-  indices, and animation key coordinates.
-- Editable Mesh, Editable Poly, common primitives, object hierarchy, pivots,
-  UV maps, and per-face material IDs.
-- MAX row-vector transforms converted to Blender's column-vector convention,
-  including stored quaternion signs and arbitrary scale-axis matrices.
-- Basic camera, camera-target, omni-light, and direct-light reconstruction,
+### File and scene decoding
+
+- Native OLE Compound File parsing without an Autodesk 3ds Max installation.
+- Support for `ClassDirectory`, `ClassDirectory2`, and `ClassDirectory3`
+  scene variants.
+- Editable Mesh, Editable Poly, PolyMeshObject, Boolean, and Shell geometry.
+- Box, sphere, cylinder, torus, cone, and plane primitives.
+- Object names, hierarchy, pivots, object offsets, UV maps, and per-face
+  material IDs.
+- Camera, camera-target, omni-light, and direct-light reconstruction,
   including camera look-at constraints.
-- Standard, legacy, Physical, Arnold Standard Surface, Arch, Raytrace, V-Ray,
-  and Corona material families where their native chunks are understood.
-- External texture lookup from the MAX directory, an optional texture root,
-  and nearby `materialsrc`, `materials`, `textures`, or `maps` directories.
-- Standard PRS animation for Linear Position/Rotation/Scale, legacy and modern
-  Bezier Position/Scale, and TCB Position/Rotation/Scale controllers.
-- Multi/Sub-Object materials preserve reference holes and explicit sparse
+
+### Performance and transforms
+
+- NumPy decoding for vertex, face, triangle, UV, material-index, and animation
+  buffers.
+- Blender bulk-data APIs for mesh and keyframe creation.
+- MAX row-vector transforms converted to Blender's column-vector convention.
+- Quaternion component/sign conversion and arbitrary static scale-axis
+  matrices.
+
+### Materials and textures
+
+- Standard, legacy Standard, Physical, Arnold Standard Surface, Arch,
+  Raytrace, V-Ray, and Corona material families where their native chunks are
+  understood.
+- Multi/Sub-Object materials with preserved reference holes and sparse
   material-ID tables.
+- External texture lookup beside the MAX file, from an explicit texture root,
+  and from nearby `materialsrc`, `materials`, `textures`, or `maps`
+  directories.
+- Base-color, roughness, specular, opacity, normal, emission, metallic, and
+  refraction inputs mapped to Blender's Principled BSDF where available.
+
+### Animation and Blender integration
+
+- Linear Position/Rotation/Scale, legacy and modern Bezier Position/Scale, and
+  TCB Position/Rotation/Scale key layouts.
+- Scene FPS and active-frame-range decoding from the MAX `Config` stream.
+- Source-key and baked-per-frame sampling modes.
 - One Blender 5.2 layered/slotted Action per imported MAX file, with one slot
   per animated object.
-- Source-key or baked-per-frame animation modes.
-- Deterministic headless import reports and saved `.blend` files for review.
+- Blender 5.2 extension packaging, file-handler integration, and drag-and-drop
+  support.
 
 ## Current limitations
 
 The `.max` format is a proprietary serialization of 3ds Max plug-in objects.
 Support is necessarily class- and version-specific.
 
-- Character Studio Biped controllers are detected and reported, but their
-  proprietary monolithic animation stream is not decoded yet.
-- Skin weights, modifier stacks, procedural animation, general constraints,
-  morphs, splines, particles, renderer proxies, and renderer-specific
-  camera/light parameters are not yet reconstructed.
-- Unsupported object classes are skipped with a console diagnostic.
-- Renderer-specific materials are converted to an approximate Principled BSDF
-  graph; exact renderer parity is not possible.
-- Animated scale-axis shear is decomposed to Blender location, quaternion, and
-  scale channels; static scale-axis matrices retain the full affine transform.
+### Objects and geometry
+
+- Unsupported or unknown plug-in object classes are skipped with a console
+  diagnostic.
+- Skin weights, modifier stacks, morph targets, explicit vertex normals,
+  smoothing groups, splines, particles, and renderer proxies are not yet
+  reconstructed.
+- Character Studio Biped objects can appear as hierarchy helpers, but they are
+  not converted into a complete Blender armature and skin.
+
+### Animation
+
+- Character Studio Biped's proprietary monolithic animation stream is
+  detected but not decoded.
+- General constraints, procedural controllers, and unsupported controller
+  classes are not reconstructed.
+- Bezier and TCB key values and timing are imported, but their tangent/TCB
+  fields are not evaluated yet; interpolation is approximated with linear
+  vectors and quaternion slerp.
+- Animated scale-axis shear is decomposed into Blender location, quaternion,
+  and scale channels. Static scale-axis matrices retain the full affine
+  transform.
+
+### Materials and rendering
+
+- Renderer-specific materials are approximated with a Principled BSDF graph;
+  exact V-Ray, Corona, Arnold, or legacy renderer parity is not possible.
+- Procedural textures, complex layered shader behavior, and renderer-specific
+  camera or light parameters are not reconstructed.
+- Missing external image files remain unresolved and must be relinked
+  manually or supplied through the texture-directory option.
 
 ## Format research
 
