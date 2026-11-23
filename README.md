@@ -127,6 +127,11 @@ The Python operator is `bpy.ops.import_scene.blender_max`.
 
 - **Image Search** searches recursively for texture basenames.
 - **Texture Directory** supplies an explicit texture root.
+- **Check Import Folder First** (add-on preference, on by default) looks for
+  each external texture by name in the folder the `.max` file was imported
+  from before trying the stored path or a recursive search. An explicitly set
+  **Texture Directory** (including its subfolders when Image Search is on)
+  always wins. Useful for source depots that keep textures beside the scenes.
 - **Object Filter** controls materials, UV maps, primitives, empties, and
   armature helpers.
 - **Apply Matrix** applies MAX object/pivot transforms.

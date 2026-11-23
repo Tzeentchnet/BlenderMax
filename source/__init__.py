@@ -29,6 +29,28 @@ if "bpy" in locals():
         importlib.reload(import_max)
 
 
+class BlenderMaxPreferences(bpy.types.AddonPreferences):
+    bl_idname = __package__
+
+    prefer_source_textures: BoolProperty(
+        name="Check Import Folder First",
+        description="Look for external textures in the folder the .max file was imported from "
+        "before trying the stored path or any recursive search. An explicitly set "
+        "Texture Directory is still checked first",
+        default=True,
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="External Textures")
+        layout.prop(self, "prefer_source_textures")
+
+
+def get_preferences(context):
+    addon = context.preferences.addons.get(__package__)
+    return addon.preferences if addon is not None else None
+
+
 @orientation_helper(axis_forward='Y', axis_up='Z')
 class ImportBlenderMax(bpy.types.Operator, ImportHelper):
     """Import Autodesk MAX"""
@@ -130,6 +152,8 @@ class ImportBlenderMax(bpy.types.Operator, ImportHelper):
         keywords = self.as_keywords(ignore=("axis_forward", "axis_up", "filter_glob"))
         global_matrix = axis_conversion(from_forward=self.axis_forward, from_up=self.axis_up,).to_4x4()
         keywords["global_matrix"] = global_matrix
+        prefs = get_preferences(context)
+        keywords["prefer_source_textures"] = bool(prefs and prefs.prefer_source_textures)
 
         return import_max.load(self, context, **keywords)
 
@@ -195,6 +219,7 @@ def menu_func(self, context):
 
 
 def register():
+    bpy.utils.register_class(BlenderMaxPreferences)
     bpy.utils.register_class(ImportBlenderMax)
     bpy.utils.register_class(IO_FH_max)
     bpy.types.TOPBAR_MT_file_import.append(menu_func)
@@ -204,6 +229,7 @@ def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func)
     bpy.utils.unregister_class(IO_FH_max)
     bpy.utils.unregister_class(ImportBlenderMax)
+    bpy.utils.unregister_class(BlenderMaxPreferences)
 
 
 if __name__ == "__main__":

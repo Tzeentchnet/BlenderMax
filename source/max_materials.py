@@ -24,10 +24,15 @@ class TextureResolver:
         source_file: str,
         texture_directory: str = "",
         recursive: bool = True,
+        prefer_source_directory: bool = False,
     ):
         self.source_file = Path(source_file).resolve()
         self.recursive = recursive
+        self.prefer_source_directory = prefer_source_directory
+        override = Path(texture_directory).resolve() if texture_directory else None
+        self.override_root = override if override is not None and override.is_dir() else None
         self.roots = self._build_roots(texture_directory)
+        self._source_listing: dict[str, Path] | None = None
 
     def _build_roots(self, texture_directory: str) -> tuple[Path, ...]:
         roots = []
@@ -55,6 +60,17 @@ class TextureResolver:
             return None
 
         texture_path = _normalized_path(texture)
+        if self.override_root is not None:
+            # An explicitly set texture directory always wins.
+            match = self._find_in_root(self.override_root, texture_path)
+            if match is not None:
+                return match
+
+        if self.prefer_source_directory:
+            match = self._find_beside_source(texture_path.name)
+            if match is not None:
+                return match
+
         if texture_path.is_absolute() and texture_path.is_file():
             return texture_path
 
@@ -91,6 +107,38 @@ class TextureResolver:
         if image is not None and data:
             image.colorspace_settings.name = "Non-Color"
         return image
+
+    def _find_in_root(self, root: Path, texture_path: Path) -> Path | None:
+        if not texture_path.is_absolute():
+            direct = root / texture_path
+            if direct.is_file():
+                return direct
+        by_name = root / texture_path.name
+        if by_name.is_file():
+            return by_name
+        if self.recursive:
+            return self._index(root).get(texture_path.name.casefold())
+        return None
+
+    def _find_beside_source(self, name: str) -> Path | None:
+        """First-pass lookup in the folder the .max file was imported from.
+
+        Matches by basename, case-insensitively, without descending into
+        subfolders, so it stays fast even on large source depots.
+        """
+        if not name:
+            return None
+        if self._source_listing is None:
+            listing = {}
+            try:
+                with os.scandir(self.source_file.parent) as entries:
+                    for entry in entries:
+                        if entry.is_file():
+                            listing.setdefault(entry.name.casefold(), Path(entry.path))
+            except OSError:
+                pass
+            self._source_listing = listing
+        return self._source_listing.get(name.casefold())
 
     @staticmethod
     def _index(root: Path) -> dict[str, Path]:

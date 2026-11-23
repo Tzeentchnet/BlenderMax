@@ -2674,11 +2674,17 @@ def read_scene(context, maxfile, settings, mscale, transform, animation_options)
     # print('Directory', maxfile.direntries[0].kids_dict.keys())
 
 
-def read(context, filename, mscale, obtypes, search, transform, texture_directory, animation_options):
+def read(context, filename, mscale, obtypes, search, transform, texture_directory, animation_options,
+         prefer_source_textures=False):
     if not is_maxfile(filename):
         raise ValueError("File is not an Autodesk 3ds Max OLE scene: %s" % filename)
 
-    resolver = TextureResolver(filename, texture_directory, search)
+    resolver = TextureResolver(
+        filename,
+        texture_directory,
+        search,
+        prefer_source_directory=prefer_source_textures,
+    )
     settings = filename, obtypes, search, resolver
     with ImportMaxFile(filename) as maxfile:
         read_class_data(maxfile, filename)
@@ -2705,7 +2711,8 @@ def read(context, filename, mscale, obtypes, search, transform, texture_director
 def load(operator, context, files=None, directory="", filepath="", scale_objects=1.0, use_collection=False,
          use_image_search=True, texture_directory="", object_filter=None, use_apply_matrix=True,
          use_animation=True, use_scene_fps=True, animation_fps=30.0,
-         animation_sampling='BAKE', frame_offset=0.0, global_matrix=None):
+         animation_sampling='BAKE', frame_offset=0.0, global_matrix=None,
+         prefer_source_textures=False):
 
     parent_dict.clear()
     matrix_dict.clear()
@@ -2758,6 +2765,7 @@ def load(operator, context, files=None, directory="", filepath="", scale_objects
                 transform=use_apply_matrix,
                 texture_directory=texture_directory,
                 animation_options=animation_options,
+                prefer_source_textures=prefer_source_textures,
             )
         return {'FINISHED'}
     except Exception as exc:
