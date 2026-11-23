@@ -2,7 +2,7 @@
 #                         2017-2022 Jens M. Plonka
 #                         2005-2018 Philippe Lagadec
 #
-# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 # Import is based on using information from `olefile` IO source-code
 # and the FreeCAD Autodesk 3DS Max importer ImportMAX.

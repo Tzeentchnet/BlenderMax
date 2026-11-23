@@ -7,7 +7,7 @@ maintainer = "BlenderMax contributors"
 type = "add-on"
 tags = ["Import-Export", "Mesh", "Material", "Animation"]
 blender_version_min = "5.2.0"
-license = ["SPDX:GPL-2.0-or-later"]
+license = ["SPDX:GPL-3.0-or-later"]
 website = "https://github.com/Tzeentchnet/BlenderMax"
 copyright = [
 	"2026 BlenderMax contributors",

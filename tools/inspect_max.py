@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 """Inspect scene nodes, geometry, modifiers, and controllers in a native MAX file.
 

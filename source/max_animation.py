@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 BlenderMax contributors
 #
-# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 from __future__ import annotations
 

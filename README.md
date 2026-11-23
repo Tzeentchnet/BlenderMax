@@ -172,5 +172,5 @@ BlenderMax remains based on work by Sebastian Schrand, Jens M. Plonka, and
 Philippe Lagadec, including code derived from FreeCAD Importer3D and the
 `olefile` parser.
 
-See [LICENSE](LICENSE). Contributions must remain compatible with the
-project's GPL license.
+See [LICENSE](LICENSE). The project is licensed under GPL-3.0-or-later.
+Contributions must remain compatible with this license.

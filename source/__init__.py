@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2023-2026 Sebastian Schrand
 #
-# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 
 __author__ = "BlenderMax contributors; Sebastian Sille; Jens M. Plonka; Philippe Lagadec"
