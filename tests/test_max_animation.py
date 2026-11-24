@@ -135,6 +135,21 @@ class AnimationTests(unittest.TestCase):
         np.testing.assert_allclose(tracks.rotation.values[0], (1.0, 0.0, 0.0, 0.0))
         np.testing.assert_allclose(tracks.scale.values[1, :3], (2.0, 2.0, 2.0))
 
+    def test_uvw_face_indices_with_and_without_count_header(self):
+        faces = [[0, 1, 2], [2, 3, 0]]
+        headerless = SimpleNamespace(data=np.asarray(faces, dtype="<u4").tobytes())
+        headed = SimpleNamespace(
+            data=np.asarray([2] + sum(faces, []), dtype="<u4").tobytes()
+        )
+
+        np.testing.assert_array_equal(
+            import_max.get_uvw_coords(headerless, face_count=2), faces
+        )
+        np.testing.assert_array_equal(
+            import_max.get_uvw_coords(headed, face_count=2), faces
+        )
+        np.testing.assert_array_equal(import_max.get_uvw_coords(headed), faces)
+
     def test_missing_ole_stream_raises_file_not_found(self):
         maxfile = object.__new__(import_max.ImportMaxFile)
         maxfile.root = SimpleNamespace(

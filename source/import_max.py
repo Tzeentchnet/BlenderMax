@@ -1168,9 +1168,12 @@ def get_poly_loops(chunk):
     return looplist
 
 
-def get_uvw_coords(chunk):
+def get_uvw_coords(chunk, face_count=None):
     data = np.frombuffer(chunk.data, dtype="<u4")
-    return data[1:1 + ((len(data) - 1) // 3) * 3].reshape(-1, 3)
+    # Most UV-face chunks start with a face count, but legacy Editable Mesh
+    # 0x0918 chunks hold exactly three indices per face with no header.
+    start = 0 if (face_count is not None and len(data) == face_count * 3) else 1
+    return data[start:start + ((len(data) - start) // 3) * 3].reshape(-1, 3)
 
 
 def get_tri_data(chunk):
@@ -2218,8 +2221,14 @@ def create_editable_mesh(context, settings, node, msh, mat):
     created = []
     if (meshchunk):
         editmesh = Mesh3d()
-        cnt = 0x0916 if (get_guid(msh) == 0x019) else 0x2394
-        uvm = 0x0918 if (get_guid(msh) == 0x019) else 0x2396 
+        # Legacy meshes store UVs in 0x0916/0x0918, newer ones in 0x2394/0x2396.
+        # Detect by presence: the class ID alone does not tell them apart.
+        legacy_uv = (
+            get_guid(msh) == 0x019
+            or meshchunk.get_first(0x0916) is not None
+        )
+        cnt = 0x0916 if legacy_uv else 0x2394
+        uvm = 0x0918 if legacy_uv else 0x2396
         vertex_chunk = meshchunk.get_first(0x0914)
         faceid_chunk = meshchunk.get_first(0x0912)
         if (vertex_chunk and faceid_chunk):
@@ -2233,7 +2242,11 @@ def create_editable_mesh(context, settings, node, msh, mat):
                 elif (chunk.types == cnt):
                     editmesh.cords.append(get_point_array(chunk.data))
                 elif (chunk.types == uvm):
-                    editmesh.uvids.append(get_uvw_coords(chunk))
+                    editmesh.uvids.append(
+                        get_uvw_coords(chunk, len(editmesh.faces))
+                    )
+            if editmesh.cords and not editmesh.maps:
+                editmesh.maps.append(0)
             created += create_shape(context, settings, node, editmesh, mat)
     return created
 
