@@ -118,7 +118,7 @@ indexed in [docs/README.md](docs/README.md).
    ```
 
 2. In Blender 5.2, open **Edit > Preferences > Get Extensions**, use
-   **Install from Disk**, and select `dist\blender_max-2.0.4.zip`.
+   **Install from Disk**, and select `dist\blender_3dsmax-2.0.4.zip`.
 3. Import a file with **File > Import > BlenderMax / Autodesk MAX (.max)**.
 
 The Python operator is `bpy.ops.import_scene.blender_max`.
@@ -159,7 +159,7 @@ The Python operator is `bpy.ops.import_scene.blender_max`.
 & "D:\Blender Foundation\Blender 5.2\blender.exe" -c extension build `
   --source-dir=source --output-dir=dist
 & "D:\Blender Foundation\Blender 5.2\blender.exe" -c extension validate `
-  dist\blender_max-2.0.4.zip
+  dist\blender_3dsmax-2.0.4.zip
 ```
 
 `tools\inspect_max.py` can dump bounded scene-node, geometry, modifier, and
