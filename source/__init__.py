@@ -4,8 +4,8 @@
 
 
 __author__ = "BlenderMax contributors; Sebastian Sille; Jens M. Plonka; Philippe Lagadec"
-__version__ = "2.0.4"
-__date__ = "23 Nov 2026"
+__version__ = "2.1.0"
+__date__ = "28 Nov 2026"
 
 
 import bpy

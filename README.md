@@ -17,6 +17,15 @@ texture discovery, and researcher-facing format documentation.
 - Box, sphere, cylinder, torus, cone, and plane primitives.
 - Object names, hierarchy, pivots, object offsets, UV maps, and per-face
   material IDs.
+- UVW Map modifiers applied directly to the base object, with planar, box,
+  and cylindrical projections, gizmo transforms, tiling, and flips.
+- Unwrap UVW and UnwrapUVW+ texture coordinates when the Unwrap's faces still
+  match the incoming mesh.
+- Edit Mesh vertex moves, vertex and face deletions, rebuilt faces, and
+  smoothing groups on Editable Mesh bases, evaluated bottom-up with the UVW
+  Map and Unwrap modifiers around them.
+- Coincident double-sided faces are kept; only faces with invalid or
+  repeated vertex indices are dropped, together with their per-face data.
 - Editable Mesh and Editable Poly smoothing masks, preserved as the
   `max_smoothing_group` face attribute and reconstructed as Blender smooth
   faces, sharp edges, and split normals.
@@ -36,12 +45,14 @@ texture discovery, and researcher-facing format documentation.
 
 - Standard, legacy Standard, Physical, Arnold Standard Surface, Arch,
   Raytrace, V-Ray, and Corona material families where their native chunks are
-  understood.
-- Multi/Sub-Object materials with preserved reference holes and sparse
-  material-ID tables.
+  understood, including 3ds Max 3-era Standard materials that use legacy
+  parameter blocks and Texmaps slots.
+- Multi/Sub-Object materials with preserved reference holes, sparse
+  material-ID tables, and wrap-around of out-of-range dense IDs.
 - External texture lookup beside the MAX file, from an explicit texture root,
-  and from nearby `materialsrc`, `materials`, `textures`, or `maps`
-  directories.
+  from nearby `materialsrc`, `materials`, `textures`, or `maps`
+  directories, and by re-rooting the stored absolute path's trailing
+  directories under the scene's parent folders when a source depot moved.
 - Base-color, roughness, specular, opacity, normal, emission, metallic, and
   refraction inputs mapped to Blender's Principled BSDF where available.
 
@@ -66,8 +77,15 @@ Support is necessarily class- and version-specific.
 
 - Unsupported or unknown plug-in object classes are skipped with a console
   diagnostic.
-- Modifier stacks are unwrapped to their base geometry but not evaluated; the
-  discarded modifiers are reported in the console.
+- Modifier stacks are evaluated bottom-up for Edit Mesh, UVW Map, and Unwrap
+  UVW only. Evaluation of geometry stops at the first other modifier; all
+  modifiers that were not applied are reported in the console.
+- Edit Mesh vertex/face creation and map edits, Edit Mesh on primitive or
+  Editable Poly bases, and face selections that limit a UVW Map above an
+  Edit Mesh are not reproduced.
+- Unwrap UVW is skipped on primitive bases and when unevaluated modifiers
+  below it change the face count.
+- UVW Map spherical, shrink-wrap, and face projections are not evaluated.
 - Native Skin and Character Studio Physique weights, morph targets, authored
   explicit vertex normals, splines, particles, and renderer proxies are not
   yet reconstructed.
@@ -118,7 +136,7 @@ indexed in [docs/README.md](docs/README.md).
    ```
 
 2. In Blender 5.2, open **Edit > Preferences > Get Extensions**, use
-   **Install from Disk**, and select `dist\blender_3dsmax-2.0.4.zip`.
+**Install from Disk**, and select `dist\blender_3dsmax-2.1.0.zip`.
 3. Import a file with **File > Import > BlenderMax / Autodesk MAX (.max)**.
 
 The Python operator is `bpy.ops.import_scene.blender_max`.
@@ -159,7 +177,7 @@ The Python operator is `bpy.ops.import_scene.blender_max`.
 & "D:\Blender Foundation\Blender 5.2\blender.exe" -c extension build `
   --source-dir=source --output-dir=dist
 & "D:\Blender Foundation\Blender 5.2\blender.exe" -c extension validate `
-  dist\blender_3dsmax-2.0.4.zip
+  dist\blender_3dsmax-2.1.0.zip
 ```
 
 `tools\inspect_max.py` can dump bounded scene-node, geometry, modifier, and

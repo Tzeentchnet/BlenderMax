@@ -73,6 +73,27 @@ class TextureResolverTests(unittest.TestCase):
         )
         self.assertEqual(resolver.resolve("floor.tga").resolve(), other.resolve())
 
+    def test_relocates_stored_path_tail_under_scene_ancestors(self):
+        # Scene copied from X:\Studio\Game\Level\Scenes to <tmp>\Level\Scenes.
+        level = Path(self.tmp.name) / "Level"
+        scene = level / "Scenes" / "Gunk" / "room.max"
+        scene.parent.mkdir(parents=True)
+        scene.write_bytes(b"")
+        expected = level / "Textures" / "brick.bmp"
+        expected.parent.mkdir()
+        expected.write_bytes(b"")
+        # A shorter tail that also exists must lose to the longer, more
+        # specific one.
+        decoy = scene.parent / "Textures" / "brick.bmp"
+        decoy.parent.mkdir()
+        decoy.write_bytes(b"")
+
+        resolver = TextureResolver(str(scene), recursive=False)
+        found = resolver.resolve(r"X:\Studio\Game\Level\Textures\brick.bmp")
+
+        self.assertEqual(found.resolve(), expected.resolve())
+        self.assertIsNone(resolver.resolve(r"X:\Studio\Game\Level\Textures\missing.bmp"))
+
 
 if __name__ == "__main__":
     unittest.main(argv=[sys.argv[0]])

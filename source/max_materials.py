@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from bpy_extras.image_utils import load_image
 
@@ -33,6 +33,7 @@ class TextureResolver:
         self.override_root = override if override is not None and override.is_dir() else None
         self.roots = self._build_roots(texture_directory)
         self._source_listing: dict[str, Path] | None = None
+        self._relocated: dict[str, Path | None] | None = None
 
     def _build_roots(self, texture_directory: str) -> tuple[Path, ...]:
         roots = []
@@ -74,6 +75,10 @@ class TextureResolver:
         if texture_path.is_absolute() and texture_path.is_file():
             return texture_path
 
+        match = self._find_relocated(texture)
+        if match is not None:
+            return match
+
         for root in self.roots:
             direct = root / texture_path
             if direct.is_file():
@@ -107,6 +112,37 @@ class TextureResolver:
         if image is not None and data:
             image.colorspace_settings.name = "Non-Color"
         return image
+
+    def _find_relocated(self, texture: str) -> Path | None:
+        """Re-root a stored path whose project tree moved.
+
+        A scene saved as ``X:/Depot/Game/Level/Textures/a.bmp`` and opened from
+        ``F:/Copy/Level/Scenes/b.max`` keeps the tail ``Level/Textures/a.bmp``.
+        The longest directory tail that exists under an ancestor of the scene
+        wins; nearer ancestors are tried first for each tail length.
+        """
+        stored = PureWindowsPath(texture.replace("/", "\\"))
+        directories = [part for part in stored.parts[:-1] if part != stored.anchor]
+        if not directories or not stored.name:
+            return None
+        if self._relocated is None:
+            self._relocated = {}
+        key = texture.casefold()
+        if key in self._relocated:
+            return self._relocated[key]
+        match = None
+        ancestors = (self.source_file.parent, *self.source_file.parent.parents)
+        for length in range(len(directories), 0, -1):
+            tail = directories[-length:]
+            for ancestor in ancestors:
+                candidate = ancestor.joinpath(*tail, stored.name)
+                if candidate.is_file():
+                    match = candidate
+                    break
+            if match is not None:
+                break
+        self._relocated[key] = match
+        return match
 
     def _find_in_root(self, root: Path, texture_path: Path) -> Path | None:
         if not texture_path.is_absolute():

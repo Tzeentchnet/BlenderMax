@@ -25,7 +25,7 @@ import struct
 import traceback
 import mathutils
 import numpy as np
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from bpy_extras.node_shader_utils import PrincipledBSDFWrapper
 
 from .max_animation import (
@@ -37,6 +37,13 @@ from .max_animation import (
     sample_transform,
 )
 from .max_materials import TextureResolver, clear_texture_cache
+from .max_uvwmap import (
+    PB_MAPTYPE,
+    SUPPORTED_MAP_TYPES,
+    UVWMapSettings,
+    map_corners,
+    object_to_gizmo,
+)
 
 
 ###################
@@ -85,6 +92,15 @@ HAIR_MTL = 0xCA41F54622C05DD6  # CoronaHairMtl
 SKIN_MODIFIER = 0x000156660095C6A3
 PHYSIQUE_MODIFIER = 0x0000000000000100
 EDIT_NORMALS_MODIFIER = 0x35CA1CDE4AA52AE3
+UVW_MAP_MODIFIER = 0x00000000000F72B1
+EDIT_MESH_MODIFIER = 0x0000000000000050
+# Edit Mesh mesh-delta chunks this decoder does not understand (vertex and
+# face creation, map-channel edits). Their presence disables evaluation.
+EDIT_MESH_UNSUPPORTED = {0x2770, 0x2771, 0x2772, 0x2775, 0x2776, 0x2781}
+UNWRAP_MODIFIERS = {
+    0x72BA4E1F02DF2E3A: 'Unwrap UVW',
+    0x72BA4F2902DF2E3A: 'UnwrapUVW+',
+}
 RAYT_MTL = 0x329B106E27190FF4  # RaytraceMtl
 PHYS_MTL = 0xDEADC0013D6B1CEC  # PhysicalMtl
 CORO_MTL = 0x448931DD70BE6506  # CoronaMtl
@@ -121,6 +137,7 @@ VID_PST_QUE = []
 SCENE_LIST = []
 
 object_list = []
+face_sources = {}  # Blender mesh pointer -> (MAX face count, kept MAX face indices)
 parent_dict = {}
 matrix_dict = {}
 target_dict = {}
@@ -322,6 +339,12 @@ class MaxFileDirEntry:
 
     def append_kids(self, child_sid):
         if child_sid == FREESECT:
+            return
+        elif child_sid >= len(self.maxfile.direntries):
+            # Truncated directory stream: the sibling tree points past the
+            # last stored entry. Keep the entries that are readable.
+            print("\tOLEWarning: directory entry %d out of range (%d entries)"
+                  % (child_sid, len(self.maxfile.direntries)))
             return
         else:
             child = self.maxfile._load_direntry(child_sid)
@@ -786,6 +809,7 @@ class Mesh3d(object):
         self.smoothing = []
         self.points = None
         self.tris = None
+        self.face_source = None
 
     def __str__(self):
         coordsize = [len(crds) // 3 for crds in self.cords]
@@ -1656,6 +1680,104 @@ def get_legacy_material(mtl):
     return material
 
 
+LEGACY_PARAMBLOCK = 0x0008  # IParamBlock (pre-ParamBlock2)
+LEGACY_BITMAP = 0x0240  # Bitmap texture
+LEGACY_TEXMAPS = 0x1200  # StdMtl Texmaps container
+
+# StdMtl Texmaps slots (keyed reference 2 * slot + 1 is the map)
+TEXMAP_DIFFUSE = 1
+TEXMAP_OPACITY = 6
+
+
+def get_paramblock_values(pblock):
+    """Return {index: value} from a legacy IParamBlock's inline values.
+
+    Each parameter is a 0x0002 container holding its index (0x0003) and one
+    inline value: float 0x0100, int 0x0101, or Point3/colour 0x0102.
+    Parameters driven by a controller carry no inline value and are omitted.
+    """
+    values = {}
+    if pblock is None:
+        return values
+    for entry in pblock.children:
+        if entry.types != 0x0002 or not getattr(entry, "children", None):
+            continue
+        index_chunk = entry.get_first(0x0003)
+        if index_chunk is None or len(index_chunk.data) < 4:
+            continue
+        index = struct.unpack_from("<i", index_chunk.data)[0]
+        for child in entry.children:
+            data = child.data
+            if child.types == 0x0100 and isinstance(data, bytes) and len(data) >= 4:
+                values[index] = struct.unpack_from("<f", data)[0]
+            elif child.types == 0x0101 and isinstance(data, bytes) and len(data) >= 4:
+                values[index] = struct.unpack_from("<i", data)[0]
+            elif child.types == 0x0102 and isinstance(data, tuple) and len(data) >= 3:
+                values[index] = tuple(data[:3])
+    return values
+
+
+def get_legacy_bitmap_path(bitmap):
+    """Return the stored file path of a Bitmap texmap, legacy or ParamBlock2."""
+    if bitmap is None:
+        return None
+    if get_guid(bitmap) == LEGACY_BITMAP:
+        info = bitmap.get_first(0x5010)
+        name = info.get_first(0x1230) if info is not None else None
+        if name is not None and isinstance(name.data, str) and name.data:
+            return name.data
+    try:
+        return get_bitmap(bitmap)
+    except Exception:
+        return None
+
+
+def get_legacy_texmap(texmaps, slot):
+    """Return the enabled map in a legacy Texmaps slot, or None."""
+    if texmaps is None or get_guid(texmaps) != LEGACY_TEXMAPS:
+        return None
+    mask = texmaps.get_first(0x5003)
+    if mask is not None and len(mask.data) >= 4:
+        if not (struct.unpack_from("<I", mask.data)[0] >> slot) & 1:
+            return None
+    return get_reference(texmaps).get(2 * slot + 1)
+
+
+def get_legacy_standard_material(refs):
+    """Decode a 3ds Max 2-4 Standard material: IParamBlock + Texmaps.
+
+    ParamBlock indices: 0 ambient, 1 diffuse, 2 specular, 3 shininess,
+    4 shininess strength, 5 self-illumination, 6 opacity, 10 IOR.
+    """
+    values = get_paramblock_values(refs[0])
+    texmaps = refs[1] if len(refs) > 1 else None
+    material = Material()
+    diffuse = values.get(1)
+    material.set('ambient', values.get(0))
+    material.set('diffuse', diffuse)
+    material.set('specular', values.get(2))
+    material.set('shinines', values.get(3))
+    strength = values.get(4)
+    if strength is not None:
+        material.set('glossines', min(max(strength, 0.0), 1.0))
+    opacity = values.get(6)
+    if opacity is not None:
+        material.set('opacity', min(max(opacity, 0.0), 1.0))
+    self_illum = values.get(5)
+    if self_illum and diffuse is not None and isinstance(self_illum, float):
+        material.set('emissive', tuple(c * self_illum for c in diffuse))
+    ior = values.get(10)
+    if ior is not None and ior > 0.0:
+        material.set('refraction', ior)
+    bitmap = get_legacy_bitmap_path(get_legacy_texmap(texmaps, TEXMAP_DIFFUSE))
+    if bitmap:
+        material.set('bitmap', bitmap)
+    transmap = get_legacy_bitmap_path(get_legacy_texmap(texmaps, TEXMAP_OPACITY))
+    if transmap:
+        material.set('transmap', transmap)
+    return material
+
+
 def get_arch_material(ad):
     material = Material()
     try:
@@ -1706,6 +1828,12 @@ def get_multi_material_ids(parameter_block, count):
     return list(range(count))
 
 
+class MaterialSlotMap(dict):
+    """Material-ID to slot mapping; ``cycle`` is set for dense ID tables."""
+
+    cycle = None
+
+
 def remap_material_indices(indices, slot_map):
     indices = np.asarray(indices, dtype=np.int32)
     if not len(indices) or not slot_map:
@@ -1714,8 +1842,13 @@ def remap_material_indices(indices, slot_map):
     fallback = slot_map.get(0, min(slot_map.values()))
     remapped = np.full(indices.shape, fallback, dtype=np.int32)
     missing = []
+    cycle = getattr(slot_map, "cycle", None)
     for material_id in np.unique(indices):
         slot = slot_map.get(int(material_id))
+        if slot is None and cycle:
+            # Dense Multi/Sub materials repeat: face ID n uses sub-material
+            # n modulo the sub-material count.
+            slot = slot_map.get(int(material_id) % cycle)
         if slot is None:
             missing.append(int(material_id))
         else:
@@ -1743,7 +1876,9 @@ def adjust_multi_material(resolver, obj, mat):
 
     submaterials = references[1:] if parameter_block is not None else references
     material_ids = get_multi_material_ids(parameter_block, count)
-    slot_map = {}
+    slot_map = MaterialSlotMap()
+    if count and material_ids == list(range(count)):
+        slot_map.cycle = count
     for index in range(count):
         material_id = material_ids[index]
         submaterial = submaterials[index] if index < len(submaterials) else None
@@ -1775,7 +1910,10 @@ def adjust_material(resolver, obj, mat):
         if (uid == 0x0002):  # Standard
             mtl_id = mat.get_first(0x4000)
             refs = get_references(mat)
-            material = get_standard_material(refs)
+            if refs and get_guid(refs[0]) == LEGACY_PARAMBLOCK:
+                material = get_legacy_standard_material(refs)
+            else:
+                material = get_standard_material(refs)
         elif (uid == 0x0006):  # Legacy
             mtl_id = mat.get_first(0x4000)
             refs = get_references(mat)
@@ -1836,7 +1974,7 @@ def adjust_material(resolver, obj, mat):
             # This prevents multiple different materials with the same name from being treated as one
             texname = material.get('bitmap', None)
             if texname is not None:
-                matname = f"{matname}_{Path(texname).stem}"
+                matname = f"{matname}_{PureWindowsPath(texname).stem}"
             objMaterial = bpy.data.materials.get(matname)
             if objMaterial is None:
                 objMaterial = bpy.data.materials.new(matname)
@@ -2032,6 +2170,58 @@ def adjust_matrix(obj, node):
     return mtx
 
 
+def sanitize_faces(mesh):
+    """Drop faces Blender cannot represent and keep per-face data aligned.
+
+    Faces with out-of-range or repeated vertex indices are removed together
+    with their material ID, smoothing mask, and UV faces. Coincident faces,
+    such as the opposite-facing copies used for double-sided walls, are kept:
+    ``Mesh.validate()`` would delete them and leave the per-face arrays longer
+    than the polygon list.
+    """
+    faces = mesh.faces
+    face_count = len(faces)
+    mesh.face_source = (face_count, np.arange(face_count))
+    if not face_count:
+        return 0
+    vertex_count = np.asarray(mesh.verts).size // 3
+    if isinstance(faces, np.ndarray) and faces.ndim == 2:
+        keep = (
+            (faces < vertex_count).all(axis=1)
+            & (faces[:, 0] != faces[:, 1])
+            & (faces[:, 1] != faces[:, 2])
+            & (faces[:, 0] != faces[:, 2])
+        )
+    else:
+        keep = np.fromiter(
+            (
+                len(face) >= 3
+                and len(set(face)) == len(face)
+                and all(0 <= index < vertex_count for index in face)
+                for face in faces
+            ),
+            dtype=np.bool_,
+            count=face_count,
+        )
+    removed = face_count - int(keep.sum())
+    if not removed:
+        return 0
+
+    def filtered(values):
+        if len(values) != face_count:
+            return values
+        if isinstance(values, np.ndarray):
+            return values[keep]
+        return [value for value, kept in zip(values, keep) if kept]
+
+    mesh.face_source = (face_count, np.flatnonzero(keep))
+    mesh.faces = filtered(faces)
+    mesh.mats = filtered(mesh.mats)
+    mesh.smoothing = filtered(mesh.smoothing)
+    mesh.uvids = [filtered(uvids) for uvids in mesh.uvids]
+    return removed
+
+
 def draw_shape(name, mesh, faces):
     vertices = np.asarray(mesh.verts, dtype=np.float32).reshape(-1, 3)
     counts = np.fromiter((len(face) for face in faces), dtype=np.int32, count=len(faces))
@@ -2049,7 +2239,9 @@ def draw_shape(name, mesh, faces):
     shape.vertices.add(len(vertices))
     shape.loops.add(looplines)
     shape.polygons.add(len(faces))
-    shape.attributes["position"].data.foreach_set("vector", vertices.ravel())
+    if len(vertices):
+        # A mesh without vertices has no position attribute in Blender 5.
+        shape.attributes["position"].data.foreach_set("vector", vertices.ravel())
     shape.polygons.foreach_set("loop_start", loopstart)
     shape.polygons.foreach_set("loop_total", counts)
     shape.loops.foreach_set("vertex_index", indices)
@@ -2061,10 +2253,11 @@ def apply_smoothing_groups(shape, smoothing_groups):
     if not len(groups):
         return shape
     if len(groups) != len(shape.polygons):
-        raise ValueError(
-            "smoothing group count %d does not match polygon count %d"
-            % (len(groups), len(shape.polygons))
+        print(
+            "\tSmoothingWarning: %d smoothing groups for %d polygons in '%s'; "
+            "smoothing skipped" % (len(groups), len(shape.polygons), shape.name)
         )
+        return shape
 
     attribute = shape.attributes.new(
         name="max_smoothing_group",
@@ -2118,7 +2311,7 @@ def draw_map(shape, uvmap, uvcoords, uvwids):
                 [np.asarray(face, dtype=np.int32) for face in uvwids]
             )
             uvloops = uvcord[uvindices].reshape(-1)
-            shape.uv_layers.active.data.foreach_set("uv", uvloops)
+            uvlayer.data.foreach_set("uv", uvloops)
         except Exception as exc:
             print('\tArrayLengthMismatchError: %s' % exc)
     return shape
@@ -2130,11 +2323,15 @@ def create_shape(context, settings, node, mesh, mat):
     name = node.get_first(0x0962)
     if name is not None:
         meshname = name.data
+    removed = sanitize_faces(mesh)
+    if removed:
+        print("\tMeshWarning: removed %d degenerate faces from '%s'" % (removed, meshname))
     meshobject = draw_shape(meshname, mesh, mesh.faces)
+    face_sources[meshobject.as_pointer()] = mesh.face_source
     if ('UV' in obtypes and mesh.maps):
-        for idx, uvm in enumerate(mesh.maps[:len(mesh.cords)]):
+        for idx, uvm in enumerate(mesh.maps[:min(len(mesh.cords), len(mesh.uvids))]):
             meshobject = draw_map(meshobject, idx, mesh.cords[idx], mesh.uvids[idx])
-    meshobject.validate()
+    meshobject.update(calc_edges=True)
     apply_smoothing_groups(meshobject, mesh.smoothing)
     meshobject.update()
     obj = bpy.data.objects.new(meshname, meshobject)
@@ -2251,11 +2448,372 @@ def create_editable_mesh(context, settings, node, msh, mat):
     return created
 
 
+def get_context_matrix(mod_app):
+    """Column-vector ModContext matrix (object to modifier-context space)."""
+    matrix = np.eye(4)
+    chunk = mod_app.get_first(0x2510) if mod_app is not None else None
+    if chunk is not None and isinstance(chunk.data, tuple) and len(chunk.data) >= 12:
+        rows = np.asarray(chunk.data[:12], dtype=np.float64).reshape(4, 3)
+        matrix[:3, :3] = rows[:3].T
+        matrix[:3, 3] = rows[3]
+    return matrix
+
+
+def get_uvw_mapping(modifier, mod_app):
+    """Decode a legacy UVW Map modifier into (settings, object-to-gizmo matrix)."""
+    refs = get_references(modifier)
+    if len(refs) < 2 or refs[1] is None or get_guid(refs[1]) != LEGACY_PARAMBLOCK:
+        return None
+    values = get_paramblock_values(refs[1])
+    if PB_MAPTYPE not in values:
+        return None
+    mapping = UVWMapSettings.from_paramblock(values)
+    if mapping.map_type not in SUPPORTED_MAP_TYPES or mapping.channel != 0:
+        return None
+    gizmo = np.array(create_matrix(refs[0])) if refs[0] is not None else np.eye(4)
+    # 3ds Max 3+ UVW Maps pre-rotate the gizmo icon (A_PLUGIN1): 180 degrees
+    # about Z for planar and box, 90 degrees for cylindrical.
+    transform = object_to_gizmo(
+        mapping,
+        gizmo,
+        get_context_matrix(mod_app),
+        rotate_icon=True,
+    )
+    return mapping, transform
+
+
+def get_unwrap_uvs(modifier):
+    """Decode Unwrap UVW local data: (texture vertices (N, 3), faces (F, 3)).
+
+    Both the 3ds Max 3 Unwrap UVW and UnwrapUVW+ classes store a full copy of
+    the channel: 0x0100 vertex count, 0x0110 Point3 texture vertices,
+    0x0230 face count, and 0x0240 three uint32 vertex indices per face.
+    """
+    chunks = [modifier.get_first(t) for t in (0x0100, 0x0110, 0x0230, 0x0240)]
+    if any(c is None or not isinstance(c.data, bytes) for c in chunks):
+        return None
+    count_chunk, vertex_chunk, face_count_chunk, face_chunk = chunks
+    if len(count_chunk.data) < 4 or len(face_count_chunk.data) < 4:
+        return None
+    count = struct.unpack_from("<I", count_chunk.data)[0]
+    face_count = struct.unpack_from("<I", face_count_chunk.data)[0]
+    if len(vertex_chunk.data) != count * 12 or len(face_chunk.data) != face_count * 12:
+        print("\tUnwrapWarning: inconsistent Unwrap UVW payload sizes")
+        return None
+    vertices = np.frombuffer(vertex_chunk.data, dtype="<f4").reshape(-1, 3)
+    faces = np.frombuffer(face_chunk.data, dtype="<u4").reshape(-1, 3)
+    if len(faces) and faces.max() >= count:
+        print("\tUnwrapWarning: Unwrap UVW face index out of range")
+        return None
+    return vertices, faces
+
+
+def apply_unwrap(obj, unwrap):
+    """Replace map channel 1 with Unwrap UVW coordinates.
+
+    Unwrap faces pair with the incoming mesh's faces by index, so this only
+    applies when the face count matches the base mesh and every polygon is a
+    triangle. Returns True when applied.
+    """
+    mesh = obj.data
+    source = face_sources.get(mesh.as_pointer())
+    vertices, faces = unwrap
+    if obj.type != 'MESH' or source is None or source[0] != len(faces):
+        return False
+    kept = source[1]
+    loop_total = np.empty(len(mesh.polygons), dtype=np.int32)
+    mesh.polygons.foreach_get("loop_total", loop_total)
+    if len(kept) != len(mesh.polygons) or (loop_total != 3).any():
+        return False
+    corners = faces[kept].reshape(-1)
+    layer = mesh.uv_layers[0] if len(mesh.uv_layers) else mesh.uv_layers.new(name="UVMap")
+    layer.data.foreach_set("uv", vertices[corners, :2].astype(np.float32).ravel())
+    return True
+
+
+def _u32_array(chunk):
+    if chunk is None or not isinstance(chunk.data, bytes) or len(chunk.data) % 4:
+        return None
+    return np.frombuffer(chunk.data, dtype="<u4")
+
+
+def _u32(chunk):
+    values = _u32_array(chunk)
+    return int(values[0]) if values is not None and len(values) else None
+
+
+def delete_sequence(count, deletions):
+    """Indices of range(count) surviving deletion at each position in turn.
+
+    Edit Mesh records deletions as positions in the list as it shrinks, so
+    deleting [3, 3] from five items removes the original items 3 and 4.
+    A Fenwick tree finds each position in O(log n), keeping large meshes
+    linear in memory and fast. Returns None for an out-of-range position.
+    """
+    deletions = np.asarray(deletions, dtype=np.int64).ravel()
+    if len(deletions) > count:
+        return None
+    if not len(deletions):
+        return np.arange(count, dtype=np.int64)
+    tree = np.ones(count + 1, dtype=np.int64)
+    tree[0] = 0
+    for index in range(1, count + 1):
+        parent = index + (index & -index)
+        if parent <= count:
+            tree[parent] += tree[index]
+    removed = np.zeros(count, dtype=np.bool_)
+    remaining = count
+    top = 1 << count.bit_length()
+    for position in deletions.tolist():
+        if position < 0 or position >= remaining:
+            return None
+        node, rank, step = 0, position + 1, top
+        while step:
+            candidate = node + step
+            if candidate <= count and tree[candidate] < rank:
+                node = candidate
+                rank -= tree[candidate]
+            step >>= 1
+        removed[node] = True
+        index = node + 1
+        while index <= count:
+            tree[index] -= 1
+            index += index & -index
+        remaining -= 1
+    return np.flatnonzero(~removed)
+
+
+def get_edit_mesh(mod_app, vertex_count, face_count):
+    """Decode 3ds Max 3 Edit Mesh local data (ModApp 0x2512), or None.
+
+    ``vertex_count`` and ``face_count`` describe the incoming mesh. The data
+    is only decoded when its stored input counts match them, so corrupt or
+    stale counts never size an allocation. Returns per-vertex offsets,
+    surviving input vertices and faces, output faces in output vertex
+    indices, and output smoothing groups.
+    """
+    local = mod_app.get_first(0x2512) if mod_app is not None else None
+    delta = local.get_first(0x2765) if local is not None else None
+    if delta is None:
+        return None
+    if any(child.types in EDIT_MESH_UNSUPPORTED for child in delta.children):
+        return None
+    if (
+        _u32(delta.get_first(0x2820)) != vertex_count
+        or _u32(delta.get_first(0x2810)) != face_count
+    ):
+        return None
+    moves = local.get_first(0x2760)
+    offsets = None
+    if moves is not None:
+        # One Point3 per input vertex. Shorter arrays occur but are not
+        # understood (padding them with zero offsets was wrong for most
+        # objects checked against exported geometry), so they are rejected.
+        if not isinstance(moves.data, bytes) or len(moves.data) != vertex_count * 12:
+            return None
+        offsets = np.frombuffer(moves.data, dtype="<f4").reshape(-1, 3)
+    vertex_deletes = _u32_array(delta.get_first(0x2790))
+    face_deletes = _u32_array(delta.get_first(0x2800))
+    alive_vertices = delete_sequence(
+        vertex_count, [] if vertex_deletes is None else vertex_deletes.tolist()
+    )
+    alive_faces = delete_sequence(
+        face_count, [] if face_deletes is None else face_deletes.tolist()
+    )
+    if alive_vertices is None or alive_faces is None:
+        return None
+    output_vertices = _u32(local.get_first(0x3000))
+    if output_vertices is not None and output_vertices != len(alive_vertices):
+        return None
+    faces = _u32_array(delta.get_first(0x2780))
+    if faces is not None:
+        if len(faces) != len(alive_faces) * 3:
+            return None
+        faces = faces.reshape(-1, 3).astype(np.int64)
+        if len(faces) and faces.max() >= len(alive_vertices):
+            return None
+    smoothing = _u32_array(delta.get_first(0x2840))
+    if smoothing is not None and len(smoothing) != len(alive_faces):
+        smoothing = None
+    return {
+        "vertex_count": vertex_count,
+        "face_count": face_count,
+        "offsets": offsets,
+        "alive_vertices": alive_vertices,
+        "alive_faces": alive_faces,
+        "faces": faces,
+        "smoothing": smoothing,
+    }
+
+
+def apply_edit_mesh(obj, edit):
+    """Rebuild obj's mesh as the Edit Mesh output. Returns True when applied.
+
+    Output face i comes from surviving input face i: its material, UVs, and
+    (unless the Edit Mesh stores new ones) smoothing groups are carried over.
+    """
+    mesh = obj.data
+    source = face_sources.get(mesh.as_pointer()) if obj.type == 'MESH' else None
+    if (
+        source is None
+        or source[0] != edit["face_count"]
+        or len(mesh.vertices) != edit["vertex_count"]
+    ):
+        return False
+    positions = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", positions)
+    positions = positions.reshape(-1, 3)
+    if edit["offsets"] is not None:
+        positions = positions + edit["offsets"]
+    alive_vertices = edit["alive_vertices"]
+    remap = -np.ones(len(positions), dtype=np.int64)
+    remap[alive_vertices] = np.arange(len(alive_vertices))
+
+    loop_start = np.empty(len(mesh.polygons), dtype=np.int32)
+    loop_total = np.empty(len(mesh.polygons), dtype=np.int32)
+    mesh.polygons.foreach_get("loop_start", loop_start)
+    mesh.polygons.foreach_get("loop_total", loop_total)
+    loop_vertices = np.empty(len(mesh.loops), dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", loop_vertices)
+    material_index = np.zeros(len(mesh.polygons), dtype=np.int32)
+    mesh.polygons.foreach_get("material_index", material_index)
+    groups = mesh.attributes.get("max_smoothing_group")
+    old_smoothing = np.zeros(len(mesh.polygons), dtype=np.int32)
+    if groups is not None and groups.domain == 'FACE':
+        groups.data.foreach_get("value", old_smoothing)
+    polygon_of = {int(face): index for index, face in enumerate(source[1])}
+
+    faces, face_poly, corner_loops, smoothing, kept = [], [], [], [], []
+    for out_index, in_face in enumerate(edit["alive_faces"]):
+        poly = polygon_of.get(int(in_face))
+        if poly is None:
+            continue
+        start, total = int(loop_start[poly]), int(loop_total[poly])
+        loops = range(start, start + total)
+        if edit["faces"] is not None:
+            face = edit["faces"][out_index]
+        else:
+            face = remap[loop_vertices[start:start + total]]
+            if (face < 0).any():
+                return False
+        if len(set(face.tolist())) != len(face):
+            continue
+        corners = []
+        for vertex in face:
+            match = next((loop for loop in loops if remap[loop_vertices[loop]] == vertex), None)
+            corners.append(start if match is None else match)
+        faces.append(face)
+        kept.append(out_index)
+        face_poly.append(poly)
+        corner_loops.extend(corners)
+        smoothing.append(
+            int(edit["smoothing"][out_index]) if edit["smoothing"] is not None else int(old_smoothing[poly])
+        )
+
+    shape = Mesh3d()
+    shape.verts = positions[alive_vertices].astype(np.float32).ravel()
+    new = draw_shape(mesh.name, shape, faces)
+    corner_loops = np.asarray(corner_loops, dtype=np.int64)
+    for layer in mesh.uv_layers:
+        uv = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+        layer.data.foreach_get("uv", uv)
+        new_layer = new.uv_layers.new(name=layer.name)
+        new_layer.data.foreach_set("uv", uv.reshape(-1, 2)[corner_loops].ravel())
+    for material in mesh.materials:
+        new.materials.append(material)
+    new.update(calc_edges=True)
+    if len(face_poly):
+        new.polygons.foreach_set("material_index", material_index[np.asarray(face_poly)])
+    apply_smoothing_groups(new, np.asarray(smoothing, dtype=np.uint32))
+    new.update()
+    face_sources[new.as_pointer()] = (len(edit["alive_faces"]), np.asarray(kept, dtype=np.int64))
+    obj.data = new
+    face_sources.pop(mesh.as_pointer(), None)
+    bpy.data.meshes.remove(mesh)
+    return True
+
+
+def evaluate_stack(obj, stack, mod_apps, uv_enabled):
+    """Evaluate supported modifiers bottom-up; return the stack indices used.
+
+    Edit Mesh and UVW Map are applied only while the mesh still equals the
+    stack's state at that point; after any modifier that is not evaluated,
+    geometry-dependent modifiers stop. Unwrap UVW replaces the whole channel
+    by face index, so it still applies whenever its faces match.
+    """
+    used = set()
+    exact = len(mod_apps) == len(stack)
+    for index in range(len(stack) - 1, -1, -1):
+        modifier = stack[index]
+        uid = get_guid(modifier) if modifier is not None else None
+        mod_app = mod_apps[index] if len(mod_apps) == len(stack) else None
+        if uid == EDIT_MESH_MODIFIER and exact and obj.type == 'MESH':
+            source = face_sources.get(obj.data.as_pointer())
+            edit = (
+                get_edit_mesh(mod_app, len(obj.data.vertices), source[0])
+                if source is not None
+                else None
+            )
+            if edit is not None and apply_edit_mesh(obj, edit):
+                used.add(index)
+                continue
+        elif uid == UVW_MAP_MODIFIER and exact:
+            if not uv_enabled:
+                continue
+            mapping = get_uvw_mapping(modifier, mod_app)
+            if mapping is not None:
+                apply_uvw_mappings(obj, [mapping])
+                used.add(index)
+                continue
+        elif uid in UNWRAP_MODIFIERS:
+            if not uv_enabled:
+                continue
+            unwrap = get_unwrap_uvs(modifier)
+            if unwrap is not None and apply_unwrap(obj, unwrap):
+                used.add(index)
+            continue
+        exact = False
+    return used
+
+
+def apply_uvw_mappings(obj, mappings):
+    """Write UVW Map results, bottom of the stack first, to map channel 1."""
+    mesh = obj.data
+    if obj.type != 'MESH' or not len(mesh.polygons):
+        return
+    positions = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", positions)
+    loop_vertices = np.empty(len(mesh.loops), dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", loop_vertices)
+    loop_start = np.empty(len(mesh.polygons), dtype=np.int32)
+    loop_total = np.empty(len(mesh.polygons), dtype=np.int32)
+    mesh.polygons.foreach_get("loop_start", loop_start)
+    mesh.polygons.foreach_get("loop_total", loop_total)
+    for mapping, transform in mappings:
+        uvw = map_corners(mapping, transform, positions, loop_vertices, loop_start, loop_total)
+        layer = mesh.uv_layers[0] if len(mesh.uv_layers) else mesh.uv_layers.new(name="UVMap")
+        layer.data.foreach_set("uv", uvw[:, :2].astype(np.float32).ravel())
+
+
 def create_shell(context, settings, node, shell, mat, mtx):
     refs = get_references(shell)
     created = []
     if refs:
-        modifiers = [ref for ref in refs[:-1] if ref is not None]
+        stack = refs[:-1]
+        mod_apps = [child for child in shell.children if child.types == 0x2500]
+        msh = refs[-1]
+        created, uid = create_mesh(context, settings, node, msh, mat, mtx)
+        # Modifiers are stored top of the stack first; evaluate_stack walks
+        # them bottom-up and reports which ones it could reproduce.
+        applied = None
+        for obj in created:
+            used = evaluate_stack(obj, stack, mod_apps, 'UV' in settings[1])
+            applied = used if applied is None else applied & used
+        applied = applied or set()
+        modifiers = [
+            ref for index, ref in enumerate(stack)
+            if ref is not None and index not in applied
+        ]
         if modifiers:
             labels = []
             for modifier in modifiers:
@@ -2275,8 +2833,6 @@ def create_shell(context, settings, node, shell, mat, mtx):
                 "\tModifierWarning: importing base geometry without applying %s"
                 % ", ".join(labels)
             )
-        msh = refs[-1]
-        created, uid = create_mesh(context, settings, node, msh, mat, mtx)
     return created
 
 
@@ -2730,6 +3286,7 @@ def load(operator, context, files=None, directory="", filepath="", scale_objects
     parent_dict.clear()
     matrix_dict.clear()
     target_dict.clear()
+    face_sources.clear()
 
     if context.window:
         context.window.cursor_set('WAIT')
@@ -2789,6 +3346,7 @@ def load(operator, context, files=None, directory="", filepath="", scale_objects
         parent_dict.clear()
         matrix_dict.clear()
         target_dict.clear()
+        face_sources.clear()
         clear_texture_cache()
         active = context.view_layer.layer_collection.children.get(default_layer.name)
         if active is not None:

@@ -198,8 +198,9 @@ Mesh deltas, so these modifier-local changes are reported but not applied.
 
 Object-space and world-space derived wrappers use fixed Scene chunk types
 `0x2032` and `0x2033`. The observed object-space wrapper class ID is
-`0x405F22F529263A68`. Its `0x2034` reference array stores modifiers in stack
-order followed by the base object. A parallel orphaned `0x2500` ModApp
+`0x405F22F529263A68`. Its `0x2034` reference array stores modifiers from the
+top of the stack down, followed by the base object; the last modifier before
+the base object is applied first. A parallel orphaned `0x2500` ModApp
 container exists for every modifier position, including modifiers with no
 local payload. The ModApp slots pair with modifier references by position.
 
@@ -218,12 +219,166 @@ Relevant modifier class IDs are:
 | `0x000156660095C6A3` | Native Skin |
 | `0x0000000000000100` with superclass `0x810` | Character Studio Physique |
 | `0x35CA1CDE4AA52AE3` | Edit Normals |
+| `0x00000000000F72B1` | UVW Map |
+| `0x72BA4E1F02DF2E3A` | Unwrap UVW (3ds Max 3) |
+| `0x72BA4F2902DF2E3A` | UnwrapUVW+ |
+| `0x0000000000000050` | Edit Mesh (3ds Max 3) |
 
-BlenderMax currently imports the final base-object reference and emits a
-console diagnostic for every discarded modifier. It does not interpret
+BlenderMax imports the base object and then evaluates the stack from the
+bottom up. Edit Mesh and UVW Map are applied while the mesh still equals the
+stack's state at that point, that is, while every modifier below them was
+evaluated. Unwrap UVW replaces the whole channel by face index, so it is
+applied whenever its face count matches the current mesh. Evaluation of
+geometry-dependent modifiers stops at the first modifier that cannot be
+reproduced; every modifier that was not applied is reported in the console. It does not interpret
 native Skin's `0x2512` payload or create speculative vertex groups. Native
 Skin and Character Studio Physique use different formats and must not share a
 decoder merely because both represent deformation weights.
+
+### UVW Map modifier
+
+**Corroborated** for 3ds Max 3-era scenes: the decoder below reproduced the
+per-corner texture coordinates that 3ds Max itself exported from the same
+scenes for most objects (see the evidence note at the end of this section).
+
+The modifier (class `0x000F72B1`, superclass `0x810`) has two references:
+
+| Reference | Content |
+|---:|---|
+| 0 | Position/Rotation/Scale controller holding the gizmo transform |
+| 1 | Legacy parameter block (`0x0008`, see [Legacy parameter blocks](#legacy-parameter-blocks)) |
+
+Observed parameter indices (13 parameters; a 16-parameter variant also
+exists and is decoded with the same first 13 indices):
+
+| Index | Type | Meaning |
+|---:|---|---|
+| 0 | int | Map type: 0 planar, 1 cylindrical, 2 spherical, 3 shrink-wrap, 4 box, 5 face |
+| 1-3 | float | U, V, W tile |
+| 4-6 | int | U, V, W flip |
+| 7 | int | Cylinder cap |
+| 8 | int | Channel: 0 map channel, 1 vertex colour |
+| 9 | float | Length (gizmo Y) |
+| 10 | float | Width (gizmo X) |
+| 11 | float | Height (gizmo Z) |
+| 12 | int | Alignment axis: 0 X, 1 Y, 2 Z |
+
+The modifier's ModApp `0x2510` supplies the ModContext matrix `C` (object to
+context space, row-vector `Matrix3`). In column-vector form, object points map
+to the unit gizmo through:
+
+```text
+inverse(G @ I @ A @ S) @ C
+G  gizmo PRS controller value
+I  icon pre-rotation: 180 deg about Z (planar, box), 90 deg (cylindrical)
+A  axis alignment: X -> rotate Y by -90 deg; Y -> rotate X by +90 deg
+S  scale(width, length, height); planar uses height 1
+```
+
+In unit gizmo coordinates `(x, y, z)`:
+
+| Map | U | V |
+|---|---|---|
+| Planar | `x + 0.5` | `y + 0.5` |
+| Box, normal +X / -X | `y + 0.5` / `-y + 0.5` | `z + 0.5` |
+| Box, normal +Y / -Y | `-x + 0.5` / `x + 0.5` | `z + 0.5` |
+| Box, normal +Z / -Z | `x + 0.5` / `-x + 0.5` | `y + 0.5` |
+| Cylindrical | `atan2(y, x) / 2pi + 0.5` | `z + 0.5` |
+
+Box mapping chooses the side from the dominant component of the face normal
+in gizmo space. Flip applies `1 - value` before multiplying by the tile
+factor.
+
+Evidence: across 851 scenes with matching exporter output, corners matched
+exactly for 83% of single box maps, 93-100% of stacked box maps, 78% of
+planar maps, and 84% of cylindrical maps; objects with stored UVs matched
+99.6%. Per-object results are bimodal (almost all corners or almost none),
+consistent with exports made before later scene edits rather than a formula
+error. Spherical, shrink-wrap, and face mapping, cylinder caps, and the
+16-parameter variant's extra fields are **Tentative** or **Unknown** and are
+not evaluated, except that cylinder caps are applied as planar projections.
+
+BlenderMax evaluates only the contiguous UVW Maps immediately above the base
+object. A UVW Map above an Edit Mesh or other modifier can depend on that
+modifier's sub-object selection, which is not decoded.
+
+### Edit Mesh modifier
+
+**Corroborated** for the 3ds Max 3 Edit Mesh (class `0x50`, superclass
+`0x810`). The modifier itself stores only editor settings; the edit lives in
+its ModApp's `0x2512` container. It does not store a sequence of operations
+but the result relative to the incoming mesh:
+
+| Chunk | Content |
+|---:|---|
+| `0x2740` | `uint32` sub-object level |
+| `0x2750` / `0x2755` / `0x2756` -> `0x2700` | Selection bit arrays (vertex / face / edge); **Tentative** |
+| `0x2760` | One object-space Point3 offset per incoming vertex |
+| `0x3000` | `uint32` output vertex count |
+| `0x2765` | Mesh-delta container (below) |
+
+Inside `0x2765`:
+
+| Chunk | Content |
+|---:|---|
+| `0x2820` / `0x2810` | `uint32` incoming vertex / face count |
+| `0x2790` | Vertex deletions |
+| `0x2800` | Face deletions |
+| `0x2780` | Output faces: three `uint32` output-vertex indices each |
+| `0x2840` | `uint32` smoothing groups per output face |
+| `0x2830` | `uint32` face flags; **Unknown** |
+| `0x3010`-`0x3040` | Further counts; **Unknown** |
+| `0x2770`-`0x2776`, `0x2781` | Vertex/face creation and map edits; **Unknown** |
+
+Deletions are positions in the list as it shrinks: deleting `[3, 3]` from five
+items removes the original items 3 and 4. Output face `i` is surviving input
+face `i`; its material ID and texture coordinates carry over, and `0x2780`
+gives its corners in the renumbered vertex list. Output vertex `j` is the
+`j`-th surviving input vertex plus its `0x2760` offset.
+
+A later layout with a `0x4000` container (vertex-move records, face creates,
+remaps, and changes) occurs in a small number of files and is not decoded.
+
+Evidence: across 338 scenes with matching exporter output, objects whose
+Edit Mesh was applied matched the exported geometry exactly for 99% of
+objects (2,232 of 2,265), and the UVs of 92.7% of textured ones. Remaining
+UV differences concentrate on UVW Maps above an Edit Mesh, which can be
+limited to the Edit Mesh's face selection; selections are not yet applied.
+
+BlenderMax applies an Edit Mesh only when the stored incoming counts equal
+the actual incoming mesh, the base is an Editable Mesh, and the delta uses no
+unknown operation chunk. A `0x2760` array shorter than the vertex count also
+occurs; padding it with zero offsets was wrong for most checked objects, so
+such data is rejected. The stored counts are compared before any array is
+sized from them, because corrupt counts occur.
+
+### Unwrap UVW modifier
+
+**Corroborated** for the 3ds Max 3 Unwrap UVW and UnwrapUVW+ classes, which
+share one layout. The modifier itself (not its ModApp) stores a complete copy
+of map channel 1:
+
+| Chunk | Content |
+|---:|---|
+| `0x0100` | `uint32` texture-vertex count `N` |
+| `0x0110` | `N` Point3 texture vertices (12 bytes each) |
+| `0x0230` | `uint32` face count `F` |
+| `0x0240` | `F` faces of three `uint32` texture-vertex indices |
+| `0x0260` | UnwrapUVW+ only: one further Point3 per texture vertex; **Unknown** |
+| `0x0120` -> `0x2700` | Selection bit array |
+| `0x0130`-`0x0250` | Editor settings; **Unknown** |
+
+UnwrapUVW+ also references one Point3 controller per texture vertex. In the
+observed files the controller values equal the `0x0110` vertices.
+
+Unwrap face `i` supplies the corners of incoming mesh face `i`, so the data
+only applies while the modifiers below it keep the face list. BlenderMax uses
+it when `F` equals the base mesh's face count and every face is a triangle,
+pairing faces by their original index even when degenerate faces were
+dropped on import. Across the ENV-paired scenes, every Unwrap-sourced object
+whose positions matched the export (84 objects, 3,051 corners) matched
+exactly. An Unwrap with fewer faces than the base mesh usually follows an
+Edit Mesh that deleted faces, and is skipped.
 
 ### Edit Normals local data
 
@@ -300,6 +455,24 @@ describing the serialized chunk layout:
 These are scene-semantic observations. They should not be used to assign chunk
 IDs unless a controlled serialized sample independently confirms the mapping.
 
+## Legacy parameter blocks
+
+Pre-ParamBlock2 objects, including 3ds Max 3 Standard materials and UVW Map
+modifiers, reference an `IParamBlock` (class `0x0008`). Its children are:
+
+```text
+0x0001  uint32 parameter count
+0x0005  uint16 version
+0x0002  one container per parameter:
+          0x0003  int32 parameter index
+          0x0004  empty marker
+          0x0100  float value      | one inline value, or none when a
+          0x0101  int32 value      | controller animates the parameter
+          0x0102  Point3 / colour  |
+```
+
+**Confirmed** for float, int, and colour parameters.
+
 ## Material classes
 
 Known combined class IDs:
@@ -321,6 +494,24 @@ Known combined class IDs:
 | `0x871517206912AB89` | Corona Physical |
 | `0x44CFDE95BEC41C73` | Corona Skin |
 | `0xCA41F54622C05DD6` | Corona Hair |
+
+### 3ds Max 3 Standard material
+
+**Confirmed.** A Standard material (`0x0002`) whose first reference is a legacy
+parameter block uses this layout:
+
+| Reference | Content |
+|---:|---|
+| 0 | Legacy parameter block: 0 ambient, 1 diffuse, 2 specular, 3 glossiness, 4 specular level, 5 self-illumination, 6 opacity, 7 opacity falloff, 8 filter colour, 9 wire size, 10 IOR, 11-16 dynamics and dimming |
+| 1 | Texmaps container (class `0x1200`) |
+
+Texmaps stores keyed references `2 * slot` (amount controller) and
+`2 * slot + 1` (map) for slots 0 ambient, 1 diffuse, 2 specular, 3 glossiness,
+4 specular level, 5 self-illumination, 6 opacity, 7 filter, 8 bump,
+9 reflection, 10 refraction, and 11 displacement. Chunk `0x5003` is a bitmask
+of enabled slots; in a 10,619-container sample it matched the populated slots
+exactly except for one disabled map. `0x5100`-`0x510B` hold per-slot amounts.
+A legacy Bitmap (`0x0240`) stores its path in `0x5010 -> 0x1230`.
 
 Property-block layouts for renderer materials are only partially understood.
 The importer extracts a common approximation: base color, specular color,
@@ -358,6 +549,9 @@ The importer subtracts one from each positive ID and preserves holes by
 creating placeholder slots when needed. Face material IDs are then remapped
 through this sparse table rather than assumed to equal the Blender slot index.
 
+Without a sparse table, IDs are dense and face IDs beyond the submaterial
+count wrap around: ID `n` uses submaterial `n mod count`.
+
 ## Texture paths
 
 Texture paths can be inline strings, linked metadata, or properties reachable
@@ -367,9 +561,20 @@ through reference graphs. The importer has observed:
 - Linked metadata under `0x1260`.
 - Renderer property graphs containing a UTF-16 property named `filename`.
 
-Only the basename should be considered portable. Absolute source paths often
-refer to another machine and are not reliable evidence of the asset's intended
-directory layout.
+Absolute source paths usually refer to another machine. The trailing
+directories are often still meaningful, because source depots tend to move as
+a whole: the resolver tries the stored path's directory tails under each
+ancestor of the opened scene, longest tail first, before falling back to
+basename searches.
+
+## Coincident faces
+
+Scenes may contain coincident faces with opposite winding, typically to make
+walls double-sided. Blender's `Mesh.validate()` deletes such duplicates, which
+also breaks the alignment of per-face smoothing, material, and UV arrays. The
+importer instead removes only faces with out-of-range or repeated vertex
+indices, filters the per-face arrays with the same mask, and keeps coincident
+faces.
 
 ## Known gaps
 
@@ -380,6 +585,10 @@ directory layout.
   Poly `0x011A` variants.
 - N-gon boundary and hidden-edge semantics in every Editable Poly version.
 - Multiple UV channels outside the currently observed mapping families.
+- Edit Mesh vertex/face creation, map-channel edits, the `0x4000` delta
+  layout, and Edit Mesh on primitive or Editable Poly bases.
+- Sub-object selections that limit a UVW Map, and Unwrap UVW data on stacks
+  whose face list changes below the Unwrap without being evaluated.
 - Exact renderer-material parity.
 - Procedural textures and renderer plug-in objects.
 - Robust Boolean operand/reference variants.
